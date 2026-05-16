@@ -18,12 +18,13 @@ STATIC_DIR = Path(__file__).parent / "static"
 # Global state populated at startup
 _stops_lookup: dict = {}   # stop_id -> {name, lat, lon}
 _od_probs: dict = {}        # (origin_id, time_period) -> [(dest_id, prob), ...]
+_activity: dict = {}        # (stop_id, time_period) -> {boardings, alightings, total}
 _time_periods: list = []
 _stops_with_trips: list = []
 
 
 def _load_data() -> None:
-    global _stops_lookup, _od_probs, _time_periods, _stops_with_trips
+    global _stops_lookup, _od_probs, _activity, _time_periods, _stops_with_trips
 
     # ── Stops ─────────────────────────────────────────────────────────────────
     log.info("Loading stops.txt …")
@@ -106,6 +107,33 @@ def _load_data() -> None:
             for row in top50.itertuples(index=False)
         ]
 
+    # ── Activity stats: boardings + alightings per (stop, time) ──────────────
+    log.info("Computing activity stats …")
+    boardings_df = (
+        od.groupby(["origin_stop", "time"])["quantity"]
+        .sum()
+        .reset_index()
+        .rename(columns={"origin_stop": "stop_id", "quantity": "boardings"})
+    )
+    alightings_df = (
+        od.groupby(["destination_stop", "time"])["quantity"]
+        .sum()
+        .reset_index()
+        .rename(columns={"destination_stop": "stop_id", "quantity": "alightings"})
+    )
+    act_df = boardings_df.merge(alightings_df, on=["stop_id", "time"], how="outer").fillna(0)
+    act_df["boardings"] = act_df["boardings"].astype(int)
+    act_df["alightings"] = act_df["alightings"].astype(int)
+    act_df["total"] = act_df["boardings"] + act_df["alightings"]
+
+    for row in act_df[act_df["stop_id"].isin(stops_set)].itertuples(index=False):
+        _activity[(row.stop_id, row.time)] = {
+            "boardings": int(row.boardings),
+            "alightings": int(row.alightings),
+            "total": int(row.total),
+        }
+    log.info(f"  {len(_activity):,} activity records built")
+
     # ── Stops that have at least one outgoing trip to a known stop ────────────
     origin_ids = od_valid["origin_stop"].unique()
     _stops_with_trips = [
@@ -164,6 +192,19 @@ def predict(origin_stop_id: str, time_period: str):
         for sid, prob in entries
         if sid in _stops_lookup
     ]
+
+
+@app.get("/activity")
+def get_activity(origin_stop_id: str, time_period: str):
+    data = _activity.get((origin_stop_id, time_period))
+    if not data or origin_stop_id not in _stops_lookup:
+        return {}
+    return {
+        "stop_id": origin_stop_id,
+        "stop_name": _stops_lookup[origin_stop_id]["name"],
+        "time_period": time_period,
+        **data,
+    }
 
 
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")

@@ -181,6 +181,53 @@
     }
     .leaflet-tooltip::before { display: none; }
 
+    /* ── Activity section ────────────────────────────────────────────── */
+    #activity-section { display: none; }
+
+    .activity-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 8px;
+    }
+    .activity-label {
+      font-size: 0.78rem;
+      color: #cde0ee;
+      width: 72px;
+      flex-shrink: 0;
+    }
+    .activity-value {
+      font-size: 0.78rem;
+      font-weight: 600;
+      color: #fff;
+      width: 42px;
+      text-align: right;
+      flex-shrink: 0;
+    }
+    .activity-bar-bg {
+      flex: 1;
+      background: #0d1f2d;
+      border-radius: 3px;
+      height: 6px;
+      overflow: hidden;
+    }
+    .activity-bar-fill {
+      height: 6px;
+      border-radius: 3px;
+      width: 0;
+      transition: width 0.4s ease;
+    }
+    .activity-total {
+      display: flex;
+      justify-content: space-between;
+      font-size: 0.78rem;
+      color: #6da4c4;
+      margin-top: 2px;
+      padding-top: 6px;
+      border-top: 1px solid #244f6e;
+    }
+    .activity-total span:last-child { font-weight: 600; color: #dde8f0; }
+
     /* heatmap canvas must not intercept clicks — markers sit underneath it */
     .leaflet-heatmap-layer { pointer-events: none; }
   </style>
@@ -218,6 +265,28 @@
     <div class="sb-section">
       <div class="sb-label">Time Period</div>
       <select id="time-select"></select>
+    </div>
+
+    <div id="activity-section" class="sb-section">
+      <div class="sb-label">Station Activity — <span id="activity-period"></span></div>
+      <div class="activity-row">
+        <span class="activity-label">Boardings</span>
+        <span class="activity-value" id="boardings-val">—</span>
+        <div class="activity-bar-bg">
+          <div class="activity-bar-fill" id="boardings-bar" style="background:#4a9eca"></div>
+        </div>
+      </div>
+      <div class="activity-row">
+        <span class="activity-label">Alightings</span>
+        <span class="activity-value" id="alightings-val">—</span>
+        <div class="activity-bar-bg">
+          <div class="activity-bar-fill" id="alightings-bar" style="background:#c2185b"></div>
+        </div>
+      </div>
+      <div class="activity-total">
+        <span>Total activity</span>
+        <span id="total-val">—</span>
+      </div>
     </div>
 
     <div id="dest-section">
@@ -307,18 +376,23 @@ function selectStop(stopId, marker) {
   fetchAndRender(stopId);
 }
 
-// ── Fetch predictions and update map + sidebar ─────────────────────────────
+// ── Fetch predictions + activity and update map + sidebar ─────────────────
 async function fetchAndRender(stopId) {
   const timePeriod = document.getElementById('time-select').value;
-  const url = `${API}/predict?origin_stop_id=${encodeURIComponent(stopId)}&time_period=${encodeURIComponent(timePeriod)}`;
+  const qs = `origin_stop_id=${encodeURIComponent(stopId)}&time_period=${encodeURIComponent(timePeriod)}`;
 
-  let destinations;
+  let destinations, activity;
   try {
-    destinations = await fetch(url).then(r => r.json());
+    [destinations, activity] = await Promise.all([
+      fetch(`${API}/predict?${qs}`).then(r => r.json()),
+      fetch(`${API}/activity?${qs}`).then(r => r.json()),
+    ]);
   } catch (err) {
     console.error('Fetch failed:', err);
     return;
   }
+
+  renderActivity(activity, timePeriod);
 
   // Remove previous heatmap
   if (heatLayer) { map.removeLayer(heatLayer); heatLayer = null; }
@@ -375,6 +449,22 @@ async function fetchAndRender(stopId) {
       </div>
     </div>
   `).join('');
+}
+
+// ── Render station activity section ───────────────────────────────────────
+function renderActivity(data, timePeriod) {
+  const section = document.getElementById('activity-section');
+  if (!data || !data.total) {
+    section.style.display = 'none';
+    return;
+  }
+  document.getElementById('activity-period').textContent = timePeriod;
+  document.getElementById('boardings-val').textContent  = data.boardings.toLocaleString();
+  document.getElementById('alightings-val').textContent = data.alightings.toLocaleString();
+  document.getElementById('total-val').textContent      = data.total.toLocaleString();
+  document.getElementById('boardings-bar').style.width  = `${(data.boardings  / data.total * 100).toFixed(1)}%`;
+  document.getElementById('alightings-bar').style.width = `${(data.alightings / data.total * 100).toFixed(1)}%`;
+  section.style.display = 'block';
 }
 
 // ── Boot ───────────────────────────────────────────────────────────────────
