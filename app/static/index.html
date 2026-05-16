@@ -180,6 +180,9 @@
       box-shadow: 0 2px 8px rgba(0,0,0,0.4);
     }
     .leaflet-tooltip::before { display: none; }
+
+    /* heatmap canvas must not intercept clicks — markers sit underneath it */
+    .leaflet-heatmap-layer { pointer-events: none; }
   </style>
 </head>
 <body>
@@ -334,24 +337,24 @@ async function fetchAndRender(stopId) {
 
   const maxProb = destinations[0].probability;
 
-  // Build heatmap — normalise intensity to [0.15, 1] so dim destinations still show
-  const heatPoints = destinations.map(d => [
-    d.lat,
-    d.lon,
-    0.15 + 0.85 * (d.probability / maxProb)
-  ]);
+  // Scale intensity directly by probability so high-prob destinations dominate.
+  // maxZoom:9 = full intensity at the default SEQ overview zoom; without this
+  // Leaflet.heat divides each point by 2^(maxZoom-currentZoom) making zoom-9
+  // heatmaps nearly invisible.
+  const heatPoints = destinations.map(d => [d.lat, d.lon, d.probability / maxProb]);
 
   heatLayer = L.heatLayer(heatPoints, {
-    radius:  28,
-    blur:    22,
-    maxZoom: 14,
-    max:     1.0,
+    radius:     25,
+    blur:       20,
+    maxZoom:    9,
+    minOpacity: 0.4,
+    max:        1.0,
     gradient: {
-      0.0: '#1565c0',
-      0.3: '#7b1fa2',
-      0.6: '#c2185b',
+      0.0:  '#1565c0',
+      0.3:  '#7b1fa2',
+      0.6:  '#c2185b',
       0.85: '#ff5722',
-      1.0: '#ffeb3b'
+      1.0:  '#ffeb3b'
     }
   }).addTo(map);
 
