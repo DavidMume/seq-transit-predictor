@@ -244,6 +244,7 @@ let currentOriginId = null;
 // ── Map init ───────────────────────────────────────────────────────────────
 map = L.map('map', { zoomControl: true, preferCanvas: true })
         .setView([-27.5, 153.0], 9);
+window._seqMap = map;
 
 L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
   attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>',

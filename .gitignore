@@ -2,10 +2,28 @@ __pycache__/
 *.pyc
 .env
 venv/
+.DS_Store
+
+# data files — user supplies these locally, too large for git
 *.csv
-stops.txt
+data/stops.txt
+data/shapes.txt
+data/stop_times.txt
+data/trips.txt
+data/SEQ_GTFS/
+
+# loose GTFS files in the project root (not needed by the app)
+agency.txt
+calendar.txt
+calendar_dates.txt
+feed_info.txt
+routes.txt
 shapes.txt
 stop_times.txt
+stops.txt
 trips.txt
 SEQ_GTFS/
-.DS_Store
+
+# keep the placeholders so git tracks the empty folders
+!data/.gitkeep
+!docs/screenshots/.gitkeep

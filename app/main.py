@@ -12,7 +12,7 @@ from fastapi.staticfiles import StaticFiles
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
 log = logging.getLogger(__name__)
 
-DATA_DIR = Path(__file__).parent.parent
+DATA_DIR = Path(__file__).parent.parent / "data"
 STATIC_DIR = Path(__file__).parent / "static"
 
 # Global state populated at startup
