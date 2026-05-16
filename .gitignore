@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.env
+venv/
+*.csv
+stops.txt
+shapes.txt
+stop_times.txt
+trips.txt
+SEQ_GTFS/
+.DS_Store
