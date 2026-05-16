@@ -299,144 +299,257 @@
   </div>
 </div>
 
+<!-- Leaflet: biblioteca que dibuja el mapa interactivo en el navegador -->
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<!-- Leaflet.heat: plugin que añade a Leaflet la capacidad de dibujar mapas de calor -->
 <script src="https://unpkg.com/leaflet.heat@0.2.0/dist/leaflet-heat.js"></script>
 <script>
+// "use strict" activa el modo estricto de JavaScript: hace que el lenguaje sea
+// más exigente y avisa de errores que normalmente pasarían sin queja.
 'use strict';
 
+// API es la base de todas las URLs que llamamos al servidor.
+// Como el HTML lo sirve el mismo servidor, usamos cadena vacía ('') para
+// que las URLs sean relativas: /stops, /predict, etc.
 const API = '';
 
-let map, heatLayer;
-let selectedMarker = null;
-let currentOriginId = null;
+// --- Variables globales del mapa --------------------------------------------
+// Estas variables existen durante toda la vida de la página.
+// Las declaramos aquí (fuera de funciones) para que todas las funciones
+// puedan leerlas y modificarlas.
 
-// ── Map init ───────────────────────────────────────────────────────────────
+let map, heatLayer;          // map = el objeto del mapa de Leaflet; heatLayer = la capa del mapa de calor actual
+let selectedMarker = null;   // Guarda el marcador que el usuario tiene seleccionado actualmente
+let currentOriginId = null;  // Guarda el stop_id de la parada seleccionada actualmente
+
+// ============================================================================
+// INICIALIZACIÓN DEL MAPA
+// Creamos el mapa y lo centramos en el SEQ (Queensland, Australia).
+// preferCanvas:true hace que los marcadores se dibujen en un <canvas>
+// (más eficiente cuando hay miles de marcadores).
+// ============================================================================
 map = L.map('map', { zoomControl: true, preferCanvas: true })
-        .setView([-27.5, 153.0], 9);
+        .setView([-27.5, 153.0], 9);  // [-27.5, 153.0] es la latitud/longitud del centro del SEQ; 9 es el nivel de zoom inicial
+
+// Exponemos el mapa como variable global de la ventana para poder acceder
+// a él desde herramientas externas (como scripts de captura de pantalla).
 window._seqMap = map;
 
+// Añadimos la capa de mosaicos (tiles): las imágenes del mapa base oscuro de CartoDB.
+// {s} se reemplaza por uno de los subdominios (a, b, c, d) para distribuir la carga.
+// {z}, {x}, {y} son el nivel de zoom y las coordenadas del mosaico.
+// {r} añade "@2x" en pantallas de alta resolución (retina).
 L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
   attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>',
   subdomains: 'abcd',
-  maxZoom: 19
+  maxZoom: 19  // Nivel máximo de zoom permitido
 }).addTo(map);
 
-// ── Marker style helpers ───────────────────────────────────────────────────
-const STYLE_DEFAULT  = { radius: 4,  fillColor: '#4a9eca', color: '#1a3a52', weight: 1,   fillOpacity: 0.75 };
-const STYLE_SELECTED = { radius: 8,  fillColor: '#c2185b', color: '#ffffff', weight: 2,   fillOpacity: 1.0  };
-const STYLE_DEST     = { radius: 5,  fillColor: '#ff7043', color: '#1a3a52', weight: 1,   fillOpacity: 0.85 };
+// --- Estilos visuales para los marcadores -----------------------------------
+// Definimos tres "looks" diferentes para los círculos del mapa.
+// En vez de repetir estos valores en cada lugar, los guardamos aquí y los
+// reutilizamos. Si quieres cambiar el color de selección, solo cambia aquí.
 
-// ── Startup ────────────────────────────────────────────────────────────────
+const STYLE_DEFAULT  = { radius: 4,  fillColor: '#4a9eca', color: '#1a3a52', weight: 1,   fillOpacity: 0.75 };  // Parada normal: círculo azul pequeño
+const STYLE_SELECTED = { radius: 8,  fillColor: '#c2185b', color: '#ffffff', weight: 2,   fillOpacity: 1.0  };  // Parada seleccionada: círculo rosa-rojo más grande
+const STYLE_DEST     = { radius: 5,  fillColor: '#ff7043', color: '#1a3a52', weight: 1,   fillOpacity: 0.85 };  // Estilo reservado para destinos (actualmente no se usa visualmente)
+
+// ============================================================================
+// init() — Función de arranque: carga datos del servidor y prepara la interfaz
+//
+// Esta función se ejecuta una sola vez al abrir la página.
+// Hace dos cosas en paralelo (al mismo tiempo):
+//   1. Pide al servidor la lista de periodos de tiempo → llena el desplegable
+//   2. Pide al servidor la lista de paradas → coloca los marcadores en el mapa
+//
+// "async" significa que la función puede hacer pausas para esperar respuestas
+// del servidor sin bloquear el resto de la página.
+// ============================================================================
 async function init() {
+  // Promise.all lanza las dos peticiones al mismo tiempo y espera a que
+  // ambas terminen. Es más rápido que esperarlas una por una.
   const [timePeriods, stops] = await Promise.all([
-    fetch(`${API}/time_periods`).then(r => r.json()),
-    fetch(`${API}/stops`).then(r => r.json()),
+    fetch(`${API}/time_periods`).then(r => r.json()),  // Pedimos los periodos de tiempo y convertimos la respuesta a objeto JavaScript
+    fetch(`${API}/stops`).then(r => r.json()),          // Pedimos la lista de paradas
   ]);
 
-  // Populate time period dropdown
-  const sel = document.getElementById('time-select');
+  // --- Llenar el desplegable de periodos de tiempo -------------------------
+  const sel = document.getElementById('time-select');  // Encontramos el elemento <select> en el HTML
   timePeriods.forEach(tp => {
-    const opt = document.createElement('option');
-    opt.value = tp;
-    opt.textContent = tp;
-    sel.appendChild(opt);
+    const opt = document.createElement('option');  // Creamos una nueva opción del desplegable
+    opt.value = tp;        // El valor interno que se usará al hacer peticiones al servidor
+    opt.textContent = tp;  // El texto visible para el usuario
+    sel.appendChild(opt);  // Añadimos la opción al desplegable
   });
+
+  // Escuchamos el evento "change" del desplegable.
+  // Cada vez que el usuario cambia el periodo de tiempo, actualizamos
+  // el mapa de calor y las estadísticas de la parada seleccionada.
+  // Si no hay ninguna parada seleccionada aún, no hacemos nada.
   sel.addEventListener('change', () => {
     if (currentOriginId) fetchAndRender(currentOriginId);
   });
 
-  // Place stop markers
+  // --- Colocar marcadores en el mapa para cada parada ----------------------
+  // Recorremos la lista de paradas y creamos un marcador circular por cada una.
   stops.forEach(stop => {
+    // L.circleMarker crea un círculo en las coordenadas [lat, lon] con el estilo por defecto.
+    // El operador spread {...STYLE_DEFAULT} copia todas las propiedades del estilo
+    // sin modificar el original.
     const m = L.circleMarker([stop.lat, stop.lon], { ...STYLE_DEFAULT })
-               .addTo(map);
+               .addTo(map);  // Añadimos el marcador al mapa para que sea visible
+
+    // Guardamos los datos de la parada dentro del marcador para acceder a ellos
+    // cuando el usuario haga clic en él.
     m.stopData = stop;
+
+    // bindTooltip muestra el nombre de la parada al pasar el cursor encima.
+    // sticky:true hace que el tooltip siga al cursor en vez de aparecer fijo.
     m.bindTooltip(stop.stop_name, { sticky: true, direction: 'top', offset: [0, -4] });
+
+    // Cuando el usuario hace clic en este marcador, llamamos a selectStop
+    // pasando el ID de la parada y el objeto marcador.
     m.on('click', () => selectStop(stop.stop_id, m));
   });
 
+  // Una vez que todo está listo, ocultamos la pantalla de carga.
   document.getElementById('loading').style.display = 'none';
 }
 
-// ── Select a stop ─────────────────────────────────────────────────────────
+// ============================================================================
+// selectStop() — Maneja la selección de una parada por el usuario
+//
+// Se llama cada vez que el usuario hace clic en un marcador del mapa.
+// Hace tres cosas:
+//   1. Cambia el estilo visual: el anterior marcador vuelve a azul,
+//      el nuevo se pone rosa-rojo y más grande.
+//   2. Actualiza el nombre de la parada en el panel lateral.
+//   3. Llama a fetchAndRender para cargar las predicciones y estadísticas.
+//
+// Parámetros:
+//   stopId — el ID de la parada clicada (string)
+//   marker — el objeto marcador de Leaflet que fue clicado
+// ============================================================================
 function selectStop(stopId, marker) {
+  // Si ya había una parada seleccionada y es diferente a la nueva,
+  // restauramos su aspecto visual al estilo por defecto (azul, pequeño).
   if (selectedMarker && selectedMarker !== marker) {
     selectedMarker.setStyle(STYLE_DEFAULT);
-    selectedMarker.setRadius(STYLE_DEFAULT.radius);
+    selectedMarker.setRadius(STYLE_DEFAULT.radius);  // setRadius cambia el tamaño del círculo
   }
+
+  // Aplicamos el estilo de "seleccionado" al nuevo marcador
   marker.setStyle(STYLE_SELECTED);
-  marker.setRadius(STYLE_SELECTED.radius);
-  marker.bringToFront();
+  marker.setRadius(STYLE_SELECTED.radius);  // Lo hacemos más grande para que sea obvio cuál está seleccionado
+  marker.bringToFront();  // Lo traemos al frente para que no quede tapado por otros marcadores
+
+  // Actualizamos las variables globales con la nueva parada seleccionada
   selectedMarker = marker;
   currentOriginId = stopId;
 
+  // Mostramos el nombre de la parada en el panel lateral
   const nameEl = document.getElementById('stop-name');
   nameEl.textContent = marker.stopData.stop_name;
-  nameEl.classList.remove('placeholder');
+  nameEl.classList.remove('placeholder');  // Quitamos el estilo de texto gris/itálico de "instrucción"
 
+  // Pedimos las predicciones y estadísticas para esta parada
   fetchAndRender(stopId);
 }
 
-// ── Fetch predictions + activity and update map + sidebar ─────────────────
+// ============================================================================
+// fetchAndRender() — Pide datos al servidor y actualiza el mapa y panel lateral
+//
+// Esta función es el núcleo de la interactividad. Se llama cuando:
+//   - El usuario hace clic en una parada (desde selectStop)
+//   - El usuario cambia el periodo de tiempo en el desplegable
+//
+// Hace dos peticiones al servidor en paralelo:
+//   - /predict → los 50 destinos más probables (para el mapa de calor)
+//   - /activity → estadísticas de subidas/bajadas (para el panel lateral)
+//
+// Parámetros:
+//   stopId — el ID de la parada de origen
+// ============================================================================
 async function fetchAndRender(stopId) {
+  // Leemos el periodo de tiempo seleccionado en el desplegable en este momento
   const timePeriod = document.getElementById('time-select').value;
+
+  // Construimos la cadena de parámetros de la URL.
+  // encodeURIComponent convierte caracteres especiales (espacios, paréntesis, etc.)
+  // al formato correcto para URLs (ej: "(" se convierte en "%28").
   const qs = `origin_stop_id=${encodeURIComponent(stopId)}&time_period=${encodeURIComponent(timePeriod)}`;
 
+  // Declaramos las variables que recibirán las respuestas del servidor
   let destinations, activity;
   try {
+    // Lanzamos las dos peticiones al mismo tiempo con Promise.all.
+    // Esto es más eficiente que esperar una y luego pedir la otra.
     [destinations, activity] = await Promise.all([
-      fetch(`${API}/predict?${qs}`).then(r => r.json()),
-      fetch(`${API}/activity?${qs}`).then(r => r.json()),
+      fetch(`${API}/predict?${qs}`).then(r => r.json()),   // Predicciones de destino
+      fetch(`${API}/activity?${qs}`).then(r => r.json()),  // Estadísticas de actividad
     ]);
   } catch (err) {
+    // Si hay un error de red (ej: el servidor está apagado), lo mostramos
+    // en la consola del navegador y salimos de la función sin romper la página.
     console.error('Fetch failed:', err);
     return;
   }
 
+  // Actualizamos la sección de actividad del panel lateral con las estadísticas recibidas
   renderActivity(activity, timePeriod);
 
-  // Remove previous heatmap
+  // Eliminamos el mapa de calor anterior del mapa antes de dibujar el nuevo.
+  // Sin esto, los mapas de calor se acumularían encima uno del otro.
   if (heatLayer) { map.removeLayer(heatLayer); heatLayer = null; }
 
-  const noDataEl   = document.getElementById('no-data');
-  const hintEl     = document.getElementById('hint');
-  const destListEl = document.getElementById('dest-list');
+  // Obtenemos referencias a los elementos del HTML que vamos a modificar
+  const noDataEl   = document.getElementById('no-data');   // Mensaje "sin datos"
+  const hintEl     = document.getElementById('hint');       // Mensaje inicial de instrucciones
+  const destListEl = document.getElementById('dest-list');  // Contenedor de la lista de destinos
 
+  // Ocultamos el mensaje de instrucciones iniciales (ya no hace falta)
   hintEl.style.display = 'none';
-  destListEl.innerHTML = '';
+  destListEl.innerHTML = '';  // Borramos la lista de destinos anterior
 
+  // Si el servidor no devolvió destinos, mostramos el mensaje "sin datos" y terminamos
   if (!destinations || destinations.length === 0) {
     noDataEl.style.display = 'block';
     return;
   }
-  noDataEl.style.display = 'none';
+  noDataEl.style.display = 'none';  // Si hay datos, ocultamos el mensaje de "sin datos"
 
+  // La probabilidad más alta es la del primer elemento (la lista viene ordenada de mayor a menor)
   const maxProb = destinations[0].probability;
 
-  // Scale intensity directly by probability so high-prob destinations dominate.
-  // maxZoom:9 = full intensity at the default SEQ overview zoom; without this
-  // Leaflet.heat divides each point by 2^(maxZoom-currentZoom) making zoom-9
-  // heatmaps nearly invisible.
+  // --- Construir el mapa de calor ------------------------------------------
+  // Transformamos cada destino en un punto del mapa de calor: [latitud, longitud, intensidad].
+  // La intensidad es relativa: el destino más probable recibe 1.0, los demás proporcionalmente menos.
+  // Esto hace que los destinos más frecuentes brillen más en el mapa.
   const heatPoints = destinations.map(d => [d.lat, d.lon, d.probability / maxProb]);
 
+  // L.heatLayer crea la capa del mapa de calor con los puntos y la configuración visual.
   heatLayer = L.heatLayer(heatPoints, {
-    radius:     25,
-    blur:       20,
-    maxZoom:    9,
-    minOpacity: 0.4,
-    max:        1.0,
-    gradient: {
-      0.0:  '#1565c0',
-      0.3:  '#7b1fa2',
-      0.6:  '#c2185b',
-      0.85: '#ff5722',
-      1.0:  '#ffeb3b'
+    radius:     25,   // Radio en píxeles de cada punto de calor
+    blur:       20,   // Cuánto se difumina cada punto (mayor valor = más suave)
+    maxZoom:    9,    // Zoom al que los puntos tienen intensidad completa. Sin esto, a zoom 9 los puntos serían casi invisibles.
+    minOpacity: 0.4,  // Opacidad mínima del canvas del mapa de calor (0=transparente, 1=sólido)
+    max:        1.0,  // Intensidad máxima de los puntos (1.0 = máximo brillo)
+    gradient: {       // Colores del mapa de calor según la intensidad (de menos a más)
+      0.0:  '#1565c0',  // Azul oscuro → poca probabilidad
+      0.3:  '#7b1fa2',  // Morado
+      0.6:  '#c2185b',  // Rosa-rojo
+      0.85: '#ff5722',  // Naranja
+      1.0:  '#ffeb3b'   // Amarillo brillante → máxima probabilidad
     }
-  }).addTo(map);
+  }).addTo(map);  // Añadimos la capa al mapa para que sea visible
 
-  // Sidebar top-10
-  const top10   = destinations.slice(0, 10);
-  const topProb = top10[0].probability;
+  // --- Actualizar la lista de top 10 en el panel lateral -------------------
+  const top10   = destinations.slice(0, 10);  // Tomamos solo los primeros 10 destinos
+  const topProb = top10[0].probability;        // La probabilidad del #1 sirve como referencia para las barras
 
+  // Generamos el HTML de cada elemento de la lista y lo insertamos en el contenedor.
+  // map() transforma cada destino en una cadena de HTML.
+  // join('') une todas las cadenas en una sola sin separadores.
   destListEl.innerHTML = top10.map((d, i) => `
     <div class="dest-item">
       <div class="dest-row">
@@ -449,26 +562,58 @@ async function fetchAndRender(stopId) {
       </div>
     </div>
   `).join('');
+  // toFixed(1) redondea a 1 decimal (ej: 27.4887... → "27.5")
+  // La barra del #1 siempre será 100%; las demás son proporcionales a ella
 }
 
-// ── Render station activity section ───────────────────────────────────────
+// ============================================================================
+// renderActivity() — Muestra las estadísticas de actividad en el panel lateral
+//
+// Recibe los datos del endpoint /activity y actualiza los números y barras
+// de la sección "Station Activity" del panel lateral.
+//
+// Parámetros:
+//   data       — objeto con boardings, alightings, total (puede ser {} si no hay datos)
+//   timePeriod — el nombre del periodo de tiempo para mostrar en el título
+// ============================================================================
 function renderActivity(data, timePeriod) {
   const section = document.getElementById('activity-section');
+
+  // Si no hay datos (objeto vacío o total cero), ocultamos la sección y salimos
   if (!data || !data.total) {
     section.style.display = 'none';
     return;
   }
+
+  // Actualizamos el periodo de tiempo en el título de la sección
   document.getElementById('activity-period').textContent = timePeriod;
+
+  // toLocaleString() formatea el número con separadores de miles según el idioma del navegador
+  // (ej: 1635 → "1,635" en inglés, "1.635" en español)
   document.getElementById('boardings-val').textContent  = data.boardings.toLocaleString();
   document.getElementById('alightings-val').textContent = data.alightings.toLocaleString();
   document.getElementById('total-val').textContent      = data.total.toLocaleString();
+
+  // Calculamos el ancho de cada barra como porcentaje del total de actividad.
+  // Ejemplo: si hay 211 subidas de 1846 totales → 211/1846*100 = 11.4%
+  // toFixed(1) redondea a 1 decimal y devuelve un string, ej: "11.4"
   document.getElementById('boardings-bar').style.width  = `${(data.boardings  / data.total * 100).toFixed(1)}%`;
   document.getElementById('alightings-bar').style.width = `${(data.alightings / data.total * 100).toFixed(1)}%`;
+
+  // Mostramos la sección (estaba oculta con display:none hasta tener datos)
   section.style.display = 'block';
 }
 
-// ── Boot ───────────────────────────────────────────────────────────────────
+// ============================================================================
+// ARRANQUE DE LA APLICACIÓN
+//
+// Llamamos a init() para que todo empiece.
+// El ".catch" captura cualquier error que ocurra durante la carga inicial
+// (por ejemplo, si el servidor no está corriendo) y muestra un mensaje
+// de error claro en la pantalla de carga en vez de fallar silenciosamente.
+// ============================================================================
 init().catch(err => {
+  // Reemplazamos el contenido del overlay de carga con un mensaje de error
   document.getElementById('loading').innerHTML = `
     <h2 style="color:#c2185b;">Failed to load</h2>
     <p>${err.message || 'Could not connect to backend.'}</p>
