@@ -12,7 +12,11 @@
 # --- Importaciones -----------------------------------------------------------
 # Cada "import" trae una herramienta externa que usamos en este archivo.
 
+import gzip                             # Para leer el archivo de datos precomprimido (.pkl.gz)
 import logging                          # Para imprimir mensajes informativos mientras el servidor trabaja
+import os                               # Para leer variables de entorno (como DATA_DOWNLOAD_URL)
+import pickle                           # Para deserializar el archivo de datos precompilados
+import urllib.request                   # Para descargar el archivo de datos si no está en disco
 from contextlib import asynccontextmanager  # Nos permite ejecutar código al iniciar y al cerrar el servidor
 from glob import glob                   # Para buscar archivos usando patrones (como *.csv)
 from pathlib import Path                # Para construir rutas de archivos de forma segura en cualquier sistema operativo
@@ -36,6 +40,13 @@ log = logging.getLogger(__name__)  # Creamos un "diario" específico para este a
 DATA_DIR = Path(__file__).parent.parent / "data"    # Carpeta donde están los CSV y stops.txt
 STATIC_DIR = Path(__file__).parent / "static"       # Carpeta donde está el archivo index.html
 
+# Ruta del archivo precompilado. Si existe, el servidor arranca en segundos en vez de 30 segundos.
+PRECOMPUTED_PATH = DATA_DIR / "precomputed.pkl.gz"
+
+# URL de descarga del archivo precompilado. Se configura como variable de entorno en producción.
+# Si no está configurada, el servidor intentará leer los CSV crudos desde DATA_DIR.
+DATA_DOWNLOAD_URL = os.getenv("DATA_DOWNLOAD_URL", "")
+
 # --- Variables globales ------------------------------------------------------
 # Estas variables se llenan al arrancar el servidor y se quedan en memoria
 # mientras el servidor está corriendo. Así, cada consulta del navegador
@@ -49,16 +60,57 @@ _stops_with_trips: list = [] # Lista de paradas que tienen al menos un viaje reg
 
 
 # =============================================================================
-# _load_data() — Carga y procesa todos los datos al iniciar el servidor
+# _download_precomputed() — Descarga el archivo precompilado si no existe en disco
 #
-# Esta función se ejecuta UNA SOLA VEZ cuando el servidor arranca.
-# Lee miles de registros de viajes y los convierte en estructuras rápidas
-# de consultar. Puede tardar 30 segundos pero vale la pena: después,
-# cada pregunta del usuario se responde en menos de un milisegundo.
-#
-# No devuelve nada — guarda todo en las variables globales de arriba.
+# Solo se ejecuta si DATA_DOWNLOAD_URL está configurado (en producción) y el
+# archivo precomputed.pkl.gz no existe en la carpeta data/.
 # =============================================================================
-def _load_data() -> None:
+def _download_precomputed() -> None:
+    if PRECOMPUTED_PATH.exists():
+        return  # Ya tenemos el archivo, no hay que descargar nada
+    if not DATA_DOWNLOAD_URL:
+        return  # No hay URL configurada — asumimos que los CSV están disponibles localmente
+    log.info(f"Descargando datos precompilados desde {DATA_DOWNLOAD_URL} ...")
+    DATA_DIR.mkdir(exist_ok=True)
+    urllib.request.urlretrieve(DATA_DOWNLOAD_URL, PRECOMPUTED_PATH)
+    size_mb = PRECOMPUTED_PATH.stat().st_size / 1024 / 1024
+    log.info(f"  Descargados {size_mb:.1f} MB → {PRECOMPUTED_PATH}")
+
+
+# =============================================================================
+# _load_from_precomputed() — Carga datos desde el archivo pickle comprimido
+#
+# Si el archivo precomputed.pkl.gz existe, carga todas las estructuras en
+# memoria en segundos. Devuelve True si tuvo éxito, False si no existe el archivo.
+# =============================================================================
+def _load_from_precomputed() -> bool:
+    global _stops_lookup, _od_probs, _activity, _time_periods, _stops_with_trips
+    if not PRECOMPUTED_PATH.exists():
+        return False
+    log.info(f"Cargando datos precompilados desde {PRECOMPUTED_PATH} ...")
+    with gzip.open(PRECOMPUTED_PATH, "rb") as f:
+        payload = pickle.load(f)
+    _stops_lookup = payload["stops_lookup"]
+    _od_probs = payload["od_probs"]
+    _activity = payload["activity"]
+    _time_periods = payload["time_periods"]
+    _stops_with_trips = payload["stops_with_trips"]
+    log.info(
+        f"  {len(_stops_lookup):,} paradas, "
+        f"{len(_od_probs):,} pares OD, "
+        f"{len(_activity):,} registros de actividad cargados."
+    )
+    return True
+
+
+# =============================================================================
+# _load_from_csvs() — Carga y procesa todos los datos desde los CSV crudos
+#
+# Ruta de respaldo para desarrollo local cuando no existe precomputed.pkl.gz.
+# Lee miles de registros de viajes y los convierte en estructuras rápidas
+# de consultar. Puede tardar ~30 segundos para 6 meses de datos.
+# =============================================================================
+def _load_from_csvs() -> None:
     # "global" le dice a Python que queremos modificar las variables de arriba,
     # no crear variables locales nuevas con el mismo nombre.
     global _stops_lookup, _od_probs, _activity, _time_periods, _stops_with_trips
@@ -267,8 +319,13 @@ def _load_data() -> None:
 # =============================================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    _load_data()  # Cargamos todos los datos antes de aceptar cualquier petición
-    yield         # El servidor corre normalmente entre el arranque y el cierre
+    # Intentamos el camino rápido primero: archivo precompilado (segundos).
+    # Si no existe y hay URL configurada, lo descargamos primero.
+    # Como último recurso, procesamos los CSV crudos (~30 segundos).
+    _download_precomputed()
+    if not _load_from_precomputed():
+        _load_from_csvs()
+    yield  # El servidor corre normalmente entre el arranque y el cierre
 
 
 # --- Crear la aplicación FastAPI ---------------------------------------------

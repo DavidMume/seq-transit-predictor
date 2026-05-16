@@ -24,6 +24,9 @@ stops.txt
 trips.txt
 SEQ_GTFS/
 
+# precomputed data — generated locally, deployed via GitHub Release asset
+data/precomputed.pkl.gz
+
 # keep the placeholders so git tracks the empty folders
 !data/.gitkeep
 !docs/screenshots/.gitkeep
