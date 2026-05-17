@@ -21,6 +21,7 @@ from contextlib import asynccontextmanager  # Nos permite ejecutar código al in
 from glob import glob                   # Para buscar archivos usando patrones (como *.csv)
 from pathlib import Path                # Para construir rutas de archivos de forma segura en cualquier sistema operativo
 
+import numpy as np                      # Para operaciones vectorizadas rápidas sobre arrays (usado en el modelo de gravedad)
 import pandas as pd                     # La herramienta principal para leer y manipular tablas de datos (como Excel pero en código)
 from fastapi import FastAPI             # El framework (estructura base) con el que construimos el servidor web
 from fastapi.middleware.cors import CORSMiddleware   # Permite que el navegador haga peticiones al servidor sin restricciones de seguridad de origen
@@ -57,6 +58,7 @@ _od_probs: dict = {}         # Diccionario: (stop_origen, periodo) → lista de 
 _activity: dict = {}         # Diccionario: (stop_id, periodo) → {subidas, bajadas, total}. Estadísticas de actividad.
 _time_periods: list = []     # Lista con los nombres de los periodos de tiempo disponibles (ej: "Weekday (8:30am-2:59:59pm)")
 _stops_with_trips: list = [] # Lista de paradas que tienen al menos un viaje registrado — las que aparecen en el mapa
+_gravity_probs: dict = {}    # Diccionario: stop_id → lista de {stop_id, stop_name, lat, lon, probability} según modelo de gravedad
 
 
 # =============================================================================
@@ -84,7 +86,7 @@ def _download_precomputed() -> None:
 # memoria en segundos. Devuelve True si tuvo éxito, False si no existe el archivo.
 # =============================================================================
 def _load_from_precomputed() -> bool:
-    global _stops_lookup, _od_probs, _activity, _time_periods, _stops_with_trips
+    global _stops_lookup, _od_probs, _activity, _time_periods, _stops_with_trips, _gravity_probs
     if not PRECOMPUTED_PATH.exists():
         return False
     log.info(f"Cargando datos precompilados desde {PRECOMPUTED_PATH} ...")
@@ -95,10 +97,13 @@ def _load_from_precomputed() -> bool:
     _activity = payload["activity"]
     _time_periods = payload["time_periods"]
     _stops_with_trips = payload["stops_with_trips"]
+    # gravity_probs es opcional — archivos generados antes de esta versión no lo tienen
+    _gravity_probs = payload.get("gravity_probs", {})
     log.info(
         f"  {len(_stops_lookup):,} paradas, "
         f"{len(_od_probs):,} pares OD, "
-        f"{len(_activity):,} registros de actividad cargados."
+        f"{len(_activity):,} registros de actividad, "
+        f"{len(_gravity_probs):,} orígenes gravedad cargados."
     )
     return True
 
@@ -311,6 +316,107 @@ def _load_from_csvs() -> None:
 
 
 # =============================================================================
+# _compute_gravity_model() — Calcula probabilidades de destino con el modelo de gravedad
+#
+# El modelo de gravedad asume que la probabilidad de ir a una parada destino
+# depende de dos cosas:
+#   1. Qué tan "importante" es ese destino (cuánta gente lo usa en total)
+#   2. Qué tan lejos está (más lejos = menos probable, con decaimiento beta)
+#
+# La fórmula es: gravedad(A→B) = actividad_total(B) / distancia(A,B)^beta
+# La probabilidad se obtiene normalizando: P(B|A) = gravedad(A→B) / Σ gravedad(A→X)
+#
+# Es el mismo modelo que los economistas usan para predecir flujos de comercio
+# entre países ("modelo de gravedad del comercio"), aplicado aquí a transporte.
+# A diferencia del modelo empírico, NO depende del periodo de tiempo —
+# usa el peso total de actividad de cada parada sumando todos los periodos.
+# =============================================================================
+def _compute_gravity_model(beta: float = 1.5) -> None:
+    global _gravity_probs
+
+    # Usamos todas las paradas con viajes registrados como candidatas de destino
+    stop_ids = [s["stop_id"] for s in _stops_with_trips]
+    n = len(stop_ids)
+    if n == 0:
+        log.warning("No hay paradas con viajes — el modelo de gravedad no puede calcularse.")
+        return
+
+    log.info(f"Calculando modelo de gravedad para {n:,} paradas (beta={beta}) ...")
+
+    # Convertimos coordenadas a arrays numpy para aprovechar operaciones vectorizadas.
+    # En vez de un bucle Python que procesa una parada por vez, numpy procesa
+    # todo el array de una sola vez en código C compilado — mucho más rápido.
+    lats = np.array([_stops_lookup[sid]["lat"] for sid in stop_ids], dtype=np.float64)
+    lons = np.array([_stops_lookup[sid]["lon"] for sid in stop_ids], dtype=np.float64)
+
+    # Calculamos el peso de cada parada: suma de actividad total a través de TODOS
+    # los periodos de tiempo. Una parada "importante" es la que tiene muchos viajes.
+    stop_weight: dict = {}
+    for (sid, _tp), v in _activity.items():
+        stop_weight[sid] = stop_weight.get(sid, 0) + v["total"]
+    weights = np.array([float(stop_weight.get(sid, 0)) for sid in stop_ids], dtype=np.float64)
+
+    # Pre-calculamos radianes una sola vez (la fórmula Haversine los necesita)
+    lats_r = np.radians(lats)
+    lons_r = np.radians(lons)
+    R_km = 6371.0  # Radio medio de la Tierra en kilómetros
+
+    # Para cada parada origen, calculamos su distribución de probabilidades
+    for i, origin_id in enumerate(stop_ids):
+        # ── Distancia Haversine vectorizada ───────────────────────────────────
+        # Haversine es la fórmula estándar para calcular distancias sobre una esfera
+        # dadas dos pares de latitud/longitud. Aquí la calculamos desde el origen i
+        # hasta TODAS las demás paradas al mismo tiempo usando numpy.
+        dlat = lats_r - lats_r[i]
+        dlon = lons_r - lons_r[i]
+        a = (
+            np.sin(dlat / 2) ** 2
+            + np.cos(lats_r[i]) * np.cos(lats_r) * np.sin(dlon / 2) ** 2
+        )
+        dists = R_km * 2 * np.arcsin(np.sqrt(np.clip(a, 0.0, 1.0)))
+
+        # Distancia mínima de 0.05 km para evitar división por cero en paradas muy cercanas
+        dists = np.maximum(dists, 0.05)
+
+        # ── Puntuación de gravedad ────────────────────────────────────────────
+        # gravedad(A→B) = peso(B) / distancia(A,B)^beta
+        # Un beta mayor hace que la distancia "penalice" más a los destinos lejanos.
+        scores = weights / np.power(dists, beta)
+        scores[i] = 0.0  # El origen no puede ser su propio destino
+
+        total_score = scores.sum()
+        if total_score == 0.0:
+            continue  # Parada sin actividad circundante — sin predicción posible
+
+        # ── Normalizar a probabilidades ───────────────────────────────────────
+        # Dividimos por la suma total para que todos los valores sumen 1.0
+        probs = scores / total_score
+
+        # ── Seleccionar los 50 destinos más probables ─────────────────────────
+        # argpartition es más rápido que argsort completo cuando solo necesitamos
+        # los k elementos más grandes de un array grande.
+        if n >= 50:
+            top_idx = np.argpartition(probs, -50)[-50:]
+        else:
+            top_idx = np.arange(n)
+        top_idx = top_idx[np.argsort(probs[top_idx])[::-1]]  # Ordenar de mayor a menor
+
+        _gravity_probs[origin_id] = [
+            {
+                "stop_id":    stop_ids[j],
+                "stop_name":  _stops_lookup[stop_ids[j]]["name"],
+                "lat":        float(lats[j]),
+                "lon":        float(lons[j]),
+                "probability": float(probs[j]),
+            }
+            for j in top_idx
+            if probs[j] > 0
+        ]
+
+    log.info(f"  Modelo de gravedad: {len(_gravity_probs):,} orígenes indexados.")
+
+
+# =============================================================================
 # lifespan — Controla qué pasa cuando el servidor arranca y cuando se cierra
 #
 # FastAPI necesita este patrón especial (asynccontextmanager) para ejecutar
@@ -325,6 +431,10 @@ async def lifespan(app: FastAPI):
     _download_precomputed()
     if not _load_from_precomputed():
         _load_from_csvs()
+    # Si el modelo de gravedad no venía en el archivo precompilado, lo calculamos ahora.
+    # Con ~12 000 paradas tarda unos 10-15 segundos usando numpy vectorizado.
+    if not _gravity_probs:
+        _compute_gravity_model()
     yield  # El servidor corre normalmente entre el arranque y el cierre
 
 
@@ -433,6 +543,26 @@ def get_activity(origin_stop_id: str, time_period: str):
         "time_period": time_period,
         **data,  # Equivale a escribir "boardings": data["boardings"], "alightings": data["alightings"], etc.
     }
+
+
+# =============================================================================
+# Endpoint: GET /predict/gravity?origin_stop_id=X
+#
+# Devuelve los 50 destinos más probables para una parada de origen según el
+# modelo de gravedad. A diferencia de /predict, NO depende del periodo de tiempo:
+# usa la actividad total acumulada de todos los periodos como peso de cada destino.
+#
+# Parámetros:
+#   origin_stop_id — ID de la parada de origen
+#
+# Devuelve: lista de hasta 50 objetos con stop_id, stop_name, lat, lon, probability
+# =============================================================================
+@app.get("/predict/gravity")
+def predict_gravity(origin_stop_id: str):
+    # El modelo de gravedad devuelve la misma lista sin importar el periodo de tiempo.
+    # Si la parada no tiene datos de gravedad (ej: no tiene actividad registrada),
+    # devolvemos lista vacía.
+    return _gravity_probs.get(origin_stop_id, [])
 
 
 # --- Archivos estáticos y página principal -----------------------------------

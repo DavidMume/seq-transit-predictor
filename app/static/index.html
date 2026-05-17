@@ -230,6 +230,69 @@
 
     /* heatmap canvas must not intercept clicks — markers sit underneath it */
     .leaflet-heatmap-layer { pointer-events: none; }
+
+    /* ── Selector de modelo (tarjeta flotante, esquina inferior izquierda) ── */
+    .model-selector {
+      background: #1a3a52;
+      border: 1px solid #244f6e;
+      border-radius: 8px;
+      padding: 10px 12px;
+      min-width: 230px;
+      box-shadow: 0 4px 16px rgba(0,0,0,0.5);
+      /* Leaflet le asigna z-index automáticamente al control */
+    }
+    .ms-title {
+      font-size: 0.65rem;
+      text-transform: uppercase;
+      letter-spacing: 1.2px;
+      color: #6da4c4;
+      margin-bottom: 8px;
+    }
+    .ms-cards { display: flex; gap: 8px; }
+    .ms-card {
+      flex: 1;
+      padding: 8px 10px;
+      border-radius: 6px;
+      border: 1px solid #244f6e;
+      background: #0d1f2d;
+      color: #dde8f0;
+      cursor: pointer;
+      text-align: center;
+      transition: border-color 0.15s, background 0.15s;
+      user-select: none;
+    }
+    .ms-card:hover { border-color: #4a9eca; }
+    .ms-card.active {
+      background: #c2185b;
+      border-color: #c2185b;
+      color: #fff;
+      box-shadow: 0 2px 8px rgba(194,24,91,0.35);
+    }
+    .ms-card-icon  { font-size: 1.2rem; margin-bottom: 3px; }
+    .ms-card-label { font-size: 0.78rem; font-weight: 600; }
+    .ms-card-sub   { font-size: 0.63rem; opacity: 0.8; line-height: 1.3; margin-top: 2px; }
+
+    /* Etiqueta del modelo activo debajo del nombre de parada */
+    #model-label {
+      font-size: 0.72rem;
+      color: #6da4c4;
+      font-style: italic;
+      margin-top: 4px;
+      min-height: 15px;
+    }
+
+    /* Nota debajo del desplegable en modo gravedad */
+    #gravity-note {
+      font-size: 0.70rem;
+      color: #5a8aaa;
+      font-style: italic;
+      margin-top: 6px;
+      display: none;
+      line-height: 1.4;
+    }
+
+    /* Aspecto desactivado del desplegable de periodo en modo gravedad */
+    #time-select:disabled { opacity: 0.4; cursor: not-allowed; }
   </style>
 </head>
 <body>
@@ -260,11 +323,13 @@
     <div class="sb-section">
       <div class="sb-label">Selected Origin Stop</div>
       <div id="stop-name" class="placeholder">Click a stop on the map</div>
+      <div id="model-label"></div>
     </div>
 
     <div class="sb-section">
       <div class="sb-label">Time Period</div>
       <select id="time-select"></select>
+      <p id="gravity-note">Gravity model uses total activity across all periods</p>
     </div>
 
     <div id="activity-section" class="sb-section">
@@ -321,6 +386,7 @@ const API = '';
 let map, heatLayer;          // map = el objeto del mapa de Leaflet; heatLayer = la capa del mapa de calor actual
 let selectedMarker = null;   // Guarda el marcador que el usuario tiene seleccionado actualmente
 let currentOriginId = null;  // Guarda el stop_id de la parada seleccionada actualmente
+let currentModel = 'empirical'; // Modelo de predicción activo: 'empirical' o 'gravity'
 
 // ============================================================================
 // INICIALIZACIÓN DEL MAPA
@@ -345,6 +411,43 @@ L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
   maxZoom: 19  // Nivel máximo de zoom permitido
 }).addTo(map);
 
+// ============================================================================
+// SELECTOR DE MODELO — Control personalizado de Leaflet en la esquina inferior izquierda
+//
+// Leaflet permite crear controles propios usando L.Control.extend.
+// "position: 'bottomleft'" lo coloca sobre los controles de zoom del mapa.
+// L.DomEvent.disableClickPropagation evita que los clics en el panel
+// se propaguen al mapa y muevan la vista accidentalmente.
+// ============================================================================
+const ModelSelectorControl = L.Control.extend({
+  options: { position: 'bottomleft' },
+  onAdd: function () {
+    const div = L.DomUtil.create('div', 'model-selector');
+    div.innerHTML = `
+      <div class="ms-title">Prediction Model</div>
+      <div class="ms-cards">
+        <div class="ms-card active" id="card-empirical">
+          <div class="ms-card-icon">📊</div>
+          <div class="ms-card-label">Empirical</div>
+          <div class="ms-card-sub">Based on observed trips</div>
+        </div>
+        <div class="ms-card" id="card-gravity">
+          <div class="ms-card-icon">🌐</div>
+          <div class="ms-card-label">Gravity Model</div>
+          <div class="ms-card-sub">Distance × destination activity</div>
+        </div>
+      </div>
+    `;
+    // Evitamos que los clics en el control lleguen al mapa (evita zoom accidental)
+    L.DomEvent.disableClickPropagation(div);
+    // Asignamos los handlers de click a cada tarjeta
+    div.querySelector('#card-empirical').addEventListener('click', () => setModel('empirical'));
+    div.querySelector('#card-gravity').addEventListener('click', () => setModel('gravity'));
+    return div;
+  }
+});
+new ModelSelectorControl().addTo(map);
+
 // --- Estilos visuales para los marcadores -----------------------------------
 // Definimos tres "looks" diferentes para los círculos del mapa.
 // En vez de repetir estos valores en cada lugar, los guardamos aquí y los
@@ -353,6 +456,54 @@ L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
 const STYLE_DEFAULT  = { radius: 4,  fillColor: '#4a9eca', color: '#1a3a52', weight: 1,   fillOpacity: 0.75 };  // Parada normal: círculo azul pequeño
 const STYLE_SELECTED = { radius: 8,  fillColor: '#c2185b', color: '#ffffff', weight: 2,   fillOpacity: 1.0  };  // Parada seleccionada: círculo rosa-rojo más grande
 const STYLE_DEST     = { radius: 5,  fillColor: '#ff7043', color: '#1a3a52', weight: 1,   fillOpacity: 0.85 };  // Estilo reservado para destinos (actualmente no se usa visualmente)
+
+// ============================================================================
+// setModel() — Cambia el modelo de predicción activo
+//
+// Actualiza el estilo visual de las tarjetas, habilita o deshabilita el
+// desplegable de periodo, y si hay una parada seleccionada refrescamos el
+// mapa de calor inmediatamente sin que el usuario tenga que volver a hacer clic.
+//
+// Parámetros:
+//   model — 'empirical' o 'gravity'
+// ============================================================================
+function setModel(model) {
+  // Guardamos el modelo seleccionado en la variable global
+  currentModel = model;
+
+  // Actualizamos el aspecto visual de las tarjetas: activa = rosa, inactiva = oscuro
+  document.getElementById('card-empirical').classList.toggle('active', model === 'empirical');
+  document.getElementById('card-gravity').classList.toggle('active', model === 'gravity');
+
+  // El desplegable de periodo de tiempo solo tiene sentido en el modelo empírico.
+  // En modo gravedad lo desactivamos visualmente y mostramos una nota explicativa.
+  const sel = document.getElementById('time-select');
+  const gravityNote = document.getElementById('gravity-note');
+  if (model === 'gravity') {
+    sel.disabled = true;
+    gravityNote.style.display = 'block';
+  } else {
+    sel.disabled = false;
+    gravityNote.style.display = 'none';
+  }
+
+  // Actualizamos la etiqueta de modelo en el panel lateral
+  updateModelLabel();
+
+  // Si hay una parada seleccionada, recargamos el mapa de calor con el nuevo modelo
+  if (currentOriginId) fetchAndRender(currentOriginId);
+}
+
+// ============================================================================
+// updateModelLabel() — Actualiza la etiqueta de modelo debajo del nombre de parada
+// ============================================================================
+function updateModelLabel() {
+  const el = document.getElementById('model-label');
+  if (!currentOriginId) { el.textContent = ''; return; }
+  el.textContent = currentModel === 'empirical'
+    ? 'Based on 6 months of observed trips'
+    : 'Based on distance × destination activity';
+}
 
 // ============================================================================
 // init() — Función de arranque: carga datos del servidor y prepara la interfaz
@@ -452,6 +603,9 @@ function selectStop(stopId, marker) {
   nameEl.textContent = marker.stopData.stop_name;
   nameEl.classList.remove('placeholder');  // Quitamos el estilo de texto gris/itálico de "instrucción"
 
+  // Actualizamos la etiqueta que indica qué modelo está activo
+  updateModelLabel();
+
   // Pedimos las predicciones y estadísticas para esta parada
   fetchAndRender(stopId);
 }
@@ -474,10 +628,18 @@ async function fetchAndRender(stopId) {
   // Leemos el periodo de tiempo seleccionado en el desplegable en este momento
   const timePeriod = document.getElementById('time-select').value;
 
-  // Construimos la cadena de parámetros de la URL.
-  // encodeURIComponent convierte caracteres especiales (espacios, paréntesis, etc.)
-  // al formato correcto para URLs (ej: "(" se convierte en "%28").
-  const qs = `origin_stop_id=${encodeURIComponent(stopId)}&time_period=${encodeURIComponent(timePeriod)}`;
+  // encodeURIComponent convierte caracteres especiales al formato correcto para URLs
+  const originParam  = encodeURIComponent(stopId);
+  const periodParam  = encodeURIComponent(timePeriod);
+
+  // La URL de predicción varía según el modelo activo:
+  //   - Empírico:  /predict?origin_stop_id=X&time_period=Y  (depende del periodo)
+  //   - Gravedad:  /predict/gravity?origin_stop_id=X        (ignora el periodo)
+  // La actividad siempre viene del modelo empírico para el periodo seleccionado.
+  const predictUrl  = currentModel === 'gravity'
+    ? `${API}/predict/gravity?origin_stop_id=${originParam}`
+    : `${API}/predict?origin_stop_id=${originParam}&time_period=${periodParam}`;
+  const activityUrl = `${API}/activity?origin_stop_id=${originParam}&time_period=${periodParam}`;
 
   // Declaramos las variables que recibirán las respuestas del servidor
   let destinations, activity;
@@ -485,8 +647,8 @@ async function fetchAndRender(stopId) {
     // Lanzamos las dos peticiones al mismo tiempo con Promise.all.
     // Esto es más eficiente que esperar una y luego pedir la otra.
     [destinations, activity] = await Promise.all([
-      fetch(`${API}/predict?${qs}`).then(r => r.json()),   // Predicciones de destino
-      fetch(`${API}/activity?${qs}`).then(r => r.json()),  // Estadísticas de actividad
+      fetch(predictUrl).then(r => r.json()),    // Predicciones de destino (modelo seleccionado)
+      fetch(activityUrl).then(r => r.json()),   // Estadísticas de actividad (siempre empírico)
     ]);
   } catch (err) {
     // Si hay un error de red (ej: el servidor está apagado), lo mostramos

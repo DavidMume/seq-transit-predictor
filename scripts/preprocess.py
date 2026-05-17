@@ -17,6 +17,7 @@ import pickle
 from glob import glob
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 DATA_DIR = Path(__file__).parent.parent / "data"
@@ -147,14 +148,76 @@ def main():
     ]
     print(f"    {len(stops_with_trips):,} paradas con viajes válidos")
 
+    # ── Modelo de gravedad ────────────────────────────────────────
+    # El modelo de gravedad predice destinos basándose en la actividad total de
+    # cada parada destino y la distancia hasta ella. No depende del periodo de tiempo.
+    # Fórmula: P(B|A) ∝ actividad_total(B) / distancia(A,B)^beta
+    print(f"\n[6/6] Calculando modelo de gravedad ...")
+    beta = 1.5
+    stop_ids_grav = [s["stop_id"] for s in stops_with_trips]
+    n_grav = len(stop_ids_grav)
+
+    lats_g = np.array([stops_lookup[sid]["lat"] for sid in stop_ids_grav], dtype=np.float64)
+    lons_g = np.array([stops_lookup[sid]["lon"] for sid in stop_ids_grav], dtype=np.float64)
+
+    # Peso de cada parada = actividad total sumada sobre todos los periodos de tiempo
+    stop_weight: dict = {}
+    for (sid, _tp), v in activity.items():
+        stop_weight[sid] = stop_weight.get(sid, 0) + v["total"]
+    weights_g = np.array([float(stop_weight.get(sid, 0)) for sid in stop_ids_grav], dtype=np.float64)
+
+    lats_r = np.radians(lats_g)
+    lons_r = np.radians(lons_g)
+    R_km = 6371.0
+
+    gravity_probs: dict = {}
+    for i, origin_id in enumerate(stop_ids_grav):
+        dlat = lats_r - lats_r[i]
+        dlon = lons_r - lons_r[i]
+        a = (
+            np.sin(dlat / 2) ** 2
+            + np.cos(lats_r[i]) * np.cos(lats_r) * np.sin(dlon / 2) ** 2
+        )
+        dists = R_km * 2 * np.arcsin(np.sqrt(np.clip(a, 0.0, 1.0)))
+        dists = np.maximum(dists, 0.05)
+
+        scores = weights_g / np.power(dists, beta)
+        scores[i] = 0.0
+
+        total_score = scores.sum()
+        if total_score == 0.0:
+            continue
+
+        probs = scores / total_score
+
+        if n_grav >= 50:
+            top_idx = np.argpartition(probs, -50)[-50:]
+        else:
+            top_idx = np.arange(n_grav)
+        top_idx = top_idx[np.argsort(probs[top_idx])[::-1]]
+
+        gravity_probs[origin_id] = [
+            {
+                "stop_id":    stop_ids_grav[j],
+                "stop_name":  stops_lookup[stop_ids_grav[j]]["name"],
+                "lat":        float(lats_g[j]),
+                "lon":        float(lons_g[j]),
+                "probability": float(probs[j]),
+            }
+            for j in top_idx
+            if probs[j] > 0
+        ]
+    print(f"    {len(gravity_probs):,} orígenes indexados en el modelo de gravedad")
+
     # ── Guardar ───────────────────────────────────────────────────
-    print(f"\n[6/6] Guardando en {OUTPUT_PATH} ...")
+    print(f"\n[7/7] Guardando en {OUTPUT_PATH} ...")
     payload = {
         "stops_lookup":    stops_lookup,
         "od_probs":        od_probs,
         "activity":        activity,
         "time_periods":    time_periods,
         "stops_with_trips": stops_with_trips,
+        "gravity_probs":   gravity_probs,
     }
     with gzip.open(OUTPUT_PATH, "wb") as f:
         pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
