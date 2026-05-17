@@ -477,12 +477,9 @@ def build_ultra_lite():
     od = od.dropna(subset=["origin_stop", "destination_stop", "quantity"])
     print(f"    {len(od):,} filas limpias")
 
-    # ── Actividad total por parada (para total_activity en el mapa) ──
+    # ── Boardings y alightings totales por parada ────────────────
     board_tot  = od.groupby("origin_stop")["quantity"].sum()
     alight_tot = od.groupby("destination_stop")["quantity"].sum()
-    stop_activity: dict = {}
-    for sid in stops_set:
-        stop_activity[sid] = int(board_tot.get(sid, 0)) + int(alight_tot.get(sid, 0))
 
     # ── Agregación por periodo de tiempo ──────────────────────────
     od = (
@@ -512,18 +509,22 @@ def build_ultra_lite():
         ]
     print(f"    {len(od_probs):,} pares (origen, periodo) indexados")
 
-    # ── stops_lookup con total_activity ───────────────────────────
+    # ── stops_lookup con boardings, alightings, total_activity ───
     origin_ids = od_valid["origin_stop"].unique()
     stops_lookup: dict = {}
     for sid in origin_ids:
         if sid not in stops_lookup_raw:
             continue
-        s = stops_lookup_raw[sid]
+        s  = stops_lookup_raw[sid]
+        b  = int(board_tot.get(sid, 0))
+        a  = int(alight_tot.get(sid, 0))
         stops_lookup[sid] = {
             "name":           s["name"],
             "lat":            s["lat"],
             "lon":            s["lon"],
-            "total_activity": stop_activity.get(sid, 0),
+            "boardings":      b,
+            "alightings":     a,
+            "total_activity": b + a,
         }
 
     # ── Guardar ───────────────────────────────────────────────────
