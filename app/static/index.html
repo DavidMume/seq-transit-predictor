@@ -231,6 +231,19 @@
     /* heatmap canvas must not intercept clicks — markers sit underneath it */
     .leaflet-heatmap-layer { pointer-events: none; }
 
+    /* Leaflet control containers must not block map drag in any model */
+    .leaflet-bottom, .leaflet-top { pointer-events: none; }
+    .leaflet-bottom .leaflet-control, .leaflet-top .leaflet-control { pointer-events: auto; }
+
+    /* ── Time-of-day breakdown bars ─────────────────────────────────────── */
+    #trend-tod-section { margin-top: 14px; }
+    .tod-label { font-size: 0.65rem; text-transform: uppercase; letter-spacing: 1.2px; color: #6da4c4; margin-bottom: 8px; }
+    .tod-row { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; }
+    .tod-period { font-size: 0.70rem; color: #cde0ee; width: 80px; flex-shrink: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .tod-bar-bg { flex: 1; background: #0d1f2d; border-radius: 3px; height: 5px; overflow: hidden; }
+    .tod-bar-fill { height: 5px; border-radius: 3px; background: #3b82f6; transition: width 0.4s ease; }
+    .tod-value { font-size: 0.68rem; color: #6da4c4; width: 42px; text-align: right; flex-shrink: 0; }
+
     /* ── Selector de modelo (tarjeta flotante, esquina inferior izquierda) ── */
     .model-selector {
       position: relative;         /* necesario para que el tooltip use absolute dentro de este contenedor */
@@ -479,6 +492,10 @@
       <div id="trend-badge"></div>
       <div id="trend-interpretation"></div>
       <div id="trend-rsquared"></div>
+      <div id="trend-tod-section" style="display:none">
+        <div class="tod-label">Activity by time of day</div>
+        <div id="trend-tod-list"></div>
+      </div>
     </div>
 
   </div>
@@ -503,10 +520,12 @@ const API = '';
 // Las declaramos aquí (fuera de funciones) para que todas las funciones
 // puedan leerlas y modificarlas.
 
-let map, heatLayer;          // map = el objeto del mapa de Leaflet; heatLayer = la capa del mapa de calor actual
-let selectedMarker = null;   // Guarda el marcador que el usuario tiene seleccionado actualmente
-let currentOriginId = null;  // Guarda el stop_id de la parada seleccionada actualmente
-let currentModel = 'empirical'; // Modelo de predicción activo: 'empirical' o 'gravity'
+let map, heatLayer;
+let selectedMarker = null;
+let currentOriginId = null;
+let currentModel = 'empirical';
+let allMarkers = [];
+let timePeriods = [];
 
 // ============================================================================
 // INICIALIZACIÓN DEL MAPA
@@ -520,6 +539,8 @@ map = L.map('map', { zoomControl: true, preferCanvas: true })
 // Exponemos el mapa como variable global de la ventana para poder acceder
 // a él desde herramientas externas (como scripts de captura de pantalla).
 window._seqMap = map;
+
+map.on('zoomend', updateMarkerSizes);
 
 // Añadimos la capa de mosaicos (tiles): las imágenes del mapa base oscuro de CartoDB.
 // {s} se reemplaza por uno de los subdominios (a, b, c, d) para distribuir la carga.
@@ -666,6 +687,33 @@ function activityBand(activity, thresholds) {
   return 4;
 }
 
+// Returns marker radius for a given zoom level and activity band (0-4)
+function getRadiusByZoom(zoom, band) {
+  const baseByZoom = {7: 1, 8: 1.5, 9: 2, 10: 3, 11: 4, 12: 5, 13: 6, 14: 7};
+  const z = Math.min(Math.max(Math.floor(zoom), 7), 14);
+  const base = baseByZoom[z];
+  const bandScale = [1.0, 1.2, 1.4, 1.7, 2.1][band];
+  return Math.max(1, base * bandScale);
+}
+
+// Re-sizes all non-selected markers when zoom changes
+function updateMarkerSizes() {
+  const zoom = map.getZoom();
+  const weight      = zoom < 10 ? 0.5 : 1;
+  const fillOpacity = zoom < 9  ? 0.7 : 0.85;
+  allMarkers.forEach(m => {
+    const r = getRadiusByZoom(zoom, m.activityBand);
+    m.stopRadius          = r;
+    m.stopStyle.radius    = r;
+    m.stopStyle.weight    = weight;
+    m.stopStyle.fillOpacity = fillOpacity;
+    if (m !== selectedMarker) {
+      m.setRadius(r);
+      m.setStyle({ weight, fillOpacity });
+    }
+  });
+}
+
 // ============================================================================
 // setModel() — Cambia el modelo de predicción activo
 //
@@ -749,7 +797,8 @@ function updateModelLabel() {
 // del servidor sin bloquear el resto de la página.
 // ============================================================================
 async function init() {
-  const [timePeriods, stops, info] = await Promise.all([
+  let stops, info;
+  [timePeriods, stops, info] = await Promise.all([
     fetch(`${API}/time_periods`).then(r => r.json()),
     fetch(`${API}/stops`).then(r => r.json()),
     fetch(`${API}/info`).then(r => r.json()),
@@ -782,21 +831,27 @@ async function init() {
   const thresholds = [pct(0.20), pct(0.40), pct(0.60), pct(0.80)];
 
   // --- Colocar marcadores en el mapa para cada parada ----------------------
+  const initZoom    = map.getZoom();
+  const initWeight  = initZoom < 10 ? 0.5 : 1;
+  const initOpacity = initZoom < 9  ? 0.7 : 0.85;
   stops.forEach(stop => {
     const band = activityBand(stop.total_activity || 0, thresholds);
+    const r    = getRadiusByZoom(initZoom, band);
     const style = {
-      radius:      ACTIVITY_RADII[band],
+      radius:      r,
       fillColor:   ACTIVITY_COLOURS[band],
       color:       '#ffffff',
-      weight:      1,
-      fillOpacity: 0.85,
+      weight:      initWeight,
+      fillOpacity: initOpacity,
     };
     const m = L.circleMarker([stop.lat, stop.lon], style).addTo(map);
-    m.stopData  = stop;
-    m.stopStyle = style;       // Guardamos el estilo original para restaurarlo al deseleccionar
-    m.stopRadius = style.radius;
+    m.stopData     = stop;
+    m.activityBand = band;
+    m.stopStyle    = style;
+    m.stopRadius   = r;
     m.bindTooltip(stop.stop_name, { sticky: true, direction: 'top', offset: [0, -4] });
     m.on('click', () => selectStop(stop.stop_id, m));
+    allMarkers.push(m);
   });
 
   document.getElementById('loading').style.display = 'none';
@@ -1027,6 +1082,8 @@ async function fetchAndRenderTrend(stopId) {
   document.getElementById('trend-badge').textContent          = '';
   document.getElementById('trend-interpretation').textContent = '';
   document.getElementById('trend-rsquared').textContent       = '';
+  document.getElementById('trend-tod-section').style.display  = 'none';
+  document.getElementById('trend-tod-list').innerHTML         = '';
   noData.style.display = 'none';
 
   let data;
@@ -1046,6 +1103,7 @@ async function fetchAndRenderTrend(stopId) {
 
   renderTrendChart(data.timeseries, data.trend);
   renderTrendSummary(data.trend);
+  renderTrendTOD(stopId);
 }
 
 // ============================================================================
@@ -1204,6 +1262,38 @@ function renderTrendSummary(trend) {
   // ── Nota de R² con nivel de confianza ─────────────────────────
   const confidence = r_squared < 0.3 ? 'low' : r_squared < 0.6 ? 'moderate' : 'high';
   r2El.textContent = `R² = ${r_squared.toFixed(2)} — ${confidence} confidence`;
+}
+
+// ============================================================================
+// renderTrendTOD() — Fetches activity for each time period and renders bars
+// ============================================================================
+async function renderTrendTOD(stopId) {
+  const section = document.getElementById('trend-tod-section');
+  const list    = document.getElementById('trend-tod-list');
+  if (!timePeriods.length) return;
+
+  const results = await Promise.all(
+    timePeriods.map(p =>
+      fetch(`${API}/activity?origin_stop_id=${encodeURIComponent(stopId)}&time_period=${encodeURIComponent(p)}`)
+        .then(r => r.json())
+        .then(d => ({ period: p, total: (d && d.total) ? d.total : 0 }))
+        .catch(() => ({ period: p, total: 0 }))
+    )
+  );
+
+  const valid = results.filter(r => r.total > 0);
+  if (!valid.length) return;
+  valid.sort((a, b) => b.total - a.total);
+  const maxTotal = valid[0].total;
+
+  list.innerHTML = valid.map(r => `
+    <div class="tod-row">
+      <span class="tod-period" title="${r.period}">${r.period}</span>
+      <div class="tod-bar-bg"><div class="tod-bar-fill" style="width:${(r.total / maxTotal * 100).toFixed(1)}%"></div></div>
+      <span class="tod-value">${r.total.toLocaleString()}</span>
+    </div>
+  `).join('');
+  section.style.display = 'block';
 }
 
 // ============================================================================
