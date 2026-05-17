@@ -671,7 +671,6 @@ new LegendControl().addTo(map);
 // Los marcadores usan una escala de azules basada en actividad total de la parada.
 // Los 5 colores y radios corresponden a bandas de percentil (0-20, 20-40, …, 80-100).
 const ACTIVITY_COLOURS = ['#dbeafe', '#93c5fd', '#3b82f6', '#1d4ed8', '#1e3a8a'];
-const ACTIVITY_RADII   = [3, 4, 5, 6, 8];
 
 const STYLE_DEST = { radius: 5, fillColor: '#ff7043', color: '#1a3a52', weight: 1, fillOpacity: 0.85 };
 
@@ -804,7 +803,7 @@ async function init() {
   stops.forEach(stop => {
     const band = activityBand(stop.total_activity || 0, thresholds);
     const style = {
-      radius:      ACTIVITY_RADII[band],
+      radius:      4,
       fillColor:   ACTIVITY_COLOURS[band],
       color:       '#ffffff',
       weight:      1,
@@ -813,7 +812,7 @@ async function init() {
     const m = L.circleMarker([stop.lat, stop.lon], style).addTo(map);
     m.stopData  = stop;
     m.stopStyle = style;
-    m.stopRadius = style.radius;
+    m.stopRadius = 4;
     m.bindTooltip(stop.stop_name, { sticky: true, direction: 'top', offset: [0, -4] });
     m.on('click', () => selectStop(stop.stop_id, m));
   });
