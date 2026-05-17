@@ -62,6 +62,9 @@ _gravity_probs: dict = {}    # Diccionario: stop_id → lista de {stop_id, stop_
 _timeseries: dict = {}       # Diccionario: stop_id → lista cronológica de {month, boardings, alightings, total} por cada mes del dataset
 _trend: dict = {}            # Diccionario: stop_id → {slope, direction, projection_3m, r_squared} de la regresión lineal
 
+BETA_CALIBRATED: float = 1.5  # Exponente beta del modelo de gravedad, calibrado automáticamente al arrancar
+_beta_rmse: float = 0.0       # RMSE obtenido durante la calibración (0 = aún no calibrado)
+
 
 # =============================================================================
 # _download_precomputed() — Descarga el archivo precompilado si no existe en disco
@@ -451,6 +454,152 @@ def _load_from_csvs() -> None:
 
 
 # =============================================================================
+# _calibrate_beta() — Calibra el exponente beta del modelo de gravedad
+#
+# El "beta" controla qué tan fuerte penaliza la distancia en el modelo.
+# Un beta alto hace que los viajes largos sean mucho menos probables;
+# un beta bajo permite destinos lejanos con más facilidad.
+#
+# Para encontrar el beta óptimo comparamos la "Distribución de Longitud de
+# Viaje" (TLD) observada en los datos históricos contra la que predice el
+# modelo de gravedad para cada valor de beta. El beta ganador es el que
+# minimiza el RMSE entre ambas distribuciones.
+#
+# La TLD observada se construye a partir de _od_probs × subidas en _activity.
+# Para la TLD predicha se usan hasta MAX_ORIGINS paradas muestreadas.
+# =============================================================================
+def _calibrate_beta() -> None:
+    global BETA_CALIBRATED, _beta_rmse
+
+    stop_ids = [s["stop_id"] for s in _stops_with_trips]
+    n = len(stop_ids)
+    if n < 10 or not _od_probs or not _activity:
+        log.info("Calibración de beta omitida: datos insuficientes. Usando beta=1.5 por defecto.")
+        return
+
+    log.info("Calibrando beta del modelo de gravedad mediante búsqueda en cuadrícula ...")
+
+    # Índice rápido: stop_id → posición en el array
+    idx_of = {sid: i for i, sid in enumerate(stop_ids)}
+
+    # Coordenadas en radianes para cálculo Haversine vectorizado
+    lats_r = np.radians(np.array([_stops_lookup[sid]["lat"] for sid in stop_ids], dtype=np.float64))
+    lons_r = np.radians(np.array([_stops_lookup[sid]["lon"] for sid in stop_ids], dtype=np.float64))
+    R_km = 6371.0
+
+    # Peso total de actividad por parada (suma de todos los periodos de tiempo)
+    stop_weight = np.zeros(n, dtype=np.float64)
+    for (sid, _tp), v in _activity.items():
+        if sid in idx_of:
+            stop_weight[idx_of[sid]] += v["total"]
+
+    # ── Construir la TLD observada ────────────────────────────────────────────
+    # Para cada par (origen, destino) registrado estimamos el número de viajes
+    # como: viajes ≈ probabilidad_histórica × subidas_en_ese_periodo
+    # Luego agrupamos por distancia en bins de 1 km (0–50 km).
+    BIN_MAX = 50
+    obs_tld = np.zeros(BIN_MAX, dtype=np.float64)
+
+    od_oi_list, od_di_list, od_t_list = [], [], []
+    for (origin_id, time_period), dests in _od_probs.items():
+        if origin_id not in idx_of:
+            continue
+        boardings = _activity.get((origin_id, time_period), {}).get("boardings", 0)
+        if boardings == 0:
+            continue
+        oi = idx_of[origin_id]
+        for dest_id, prob in dests:
+            if dest_id not in idx_of or dest_id == origin_id:
+                continue
+            od_oi_list.append(oi)
+            od_di_list.append(idx_of[dest_id])
+            od_t_list.append(float(prob) * boardings)
+
+    if not od_t_list:
+        log.info("Sin pares OD válidos para calibración. Usando beta=1.5 por defecto.")
+        return
+
+    od_oi = np.array(od_oi_list)
+    od_di = np.array(od_di_list)
+    od_t  = np.array(od_t_list, dtype=np.float64)
+
+    dlat_obs = lats_r[od_di] - lats_r[od_oi]
+    dlon_obs = lons_r[od_di] - lons_r[od_oi]
+    a_obs    = (np.sin(dlat_obs / 2) ** 2
+                + np.cos(lats_r[od_oi]) * np.cos(lats_r[od_di]) * np.sin(dlon_obs / 2) ** 2)
+    obs_dists_km = R_km * 2 * np.arcsin(np.sqrt(np.clip(a_obs, 0.0, 1.0)))
+
+    obs_bin_idx = np.clip(obs_dists_km.astype(int), 0, BIN_MAX - 1)
+    np.add.at(obs_tld, obs_bin_idx, od_t)
+    if obs_tld.sum() == 0:
+        return
+    obs_tld /= obs_tld.sum()
+
+    # ── Matriz de distancias para la búsqueda en cuadrícula ───────────────────
+    # Muestreamos hasta MAX_ORIGINS paradas para mantener el uso de memoria
+    # razonable (matriz de ~23 MB para 300 × 12 000 paradas).
+    MAX_ORIGINS = min(n, 300)
+    sample_idxs = np.round(np.linspace(0, n - 1, MAX_ORIGINS)).astype(int)
+
+    lats_s = lats_r[sample_idxs]
+    lons_s = lons_r[sample_idxs]
+
+    # dist_m shape: (MAX_ORIGINS, n) — distancia desde cada origen muestreado a todas las paradas
+    dlat_m = lats_r[np.newaxis, :] - lats_s[:, np.newaxis]
+    dlon_m = lons_r[np.newaxis, :] - lons_s[:, np.newaxis]
+    a_m    = (np.sin(dlat_m / 2) ** 2
+              + np.cos(lats_s[:, np.newaxis]) * np.cos(lats_r[np.newaxis, :]) * np.sin(dlon_m / 2) ** 2)
+    dist_m = R_km * 2 * np.arcsin(np.sqrt(np.clip(a_m, 0.0, 1.0)))
+    dist_m = np.maximum(dist_m, 0.05)
+
+    # Índices de bin para cada par muestreado (precomputados, no cambian con beta)
+    dist_bins_m = np.clip(dist_m.astype(int), 0, BIN_MAX - 1)  # (MAX_ORIGINS, n)
+
+    # Subidas totales por parada muestreada (todos los periodos)
+    origin_boardings = np.zeros(n, dtype=np.float64)
+    for (sid, _tp), v in _activity.items():
+        if sid in idx_of:
+            origin_boardings[idx_of[sid]] += v["boardings"]
+    sample_boardings = origin_boardings[sample_idxs]
+
+    # Auto-bucles: cada origen no puede ser su propio destino
+    self_rows = np.arange(MAX_ORIGINS)
+    self_cols = sample_idxs
+
+    # ── Búsqueda en cuadrícula: beta 0.5 → 3.0 en pasos de 0.1 ──────────────
+    best_beta = 1.5
+    best_rmse = float("inf")
+
+    for beta_int in range(50, 301, 10):
+        beta = beta_int / 100.0
+
+        scores_m = stop_weight[np.newaxis, :] / np.power(dist_m, beta)
+        scores_m[self_rows, self_cols] = 0.0
+
+        total_s = scores_m.sum(axis=1, keepdims=True)
+        valid   = total_s[:, 0] > 0
+        probs_m = np.zeros_like(scores_m)
+        probs_m[valid] = scores_m[valid] / total_s[valid]
+
+        trips_m  = probs_m * sample_boardings[:, np.newaxis]
+        flat_trips = trips_m.ravel()
+        flat_bins  = dist_bins_m.ravel()
+        pred_tld   = np.bincount(flat_bins, weights=flat_trips, minlength=BIN_MAX)[:BIN_MAX]
+
+        if pred_tld.sum() > 0:
+            pred_tld /= pred_tld.sum()
+
+        rmse = float(np.sqrt(np.mean((obs_tld - pred_tld) ** 2)))
+        if rmse < best_rmse:
+            best_rmse = rmse
+            best_beta = beta
+
+    BETA_CALIBRATED = best_beta
+    _beta_rmse = round(best_rmse, 4)
+    log.info(f"Beta calibrado: {BETA_CALIBRATED} (RMSE: {best_rmse:.4f})")
+
+
+# =============================================================================
 # _compute_gravity_model() — Calcula probabilidades de destino con el modelo de gravedad
 #
 # El modelo de gravedad asume que la probabilidad de ir a una parada destino
@@ -545,7 +694,7 @@ def _compute_gravity_model(beta: float = 1.5) -> None:
                 "probability": float(probs[j]),
             }
             for j in top_idx
-            if probs[j] > 0
+            if probs[j] > 0 and stop_ids[j] != origin_id  # Excluir auto-bucles explícitamente
         ]
 
     log.info(f"  Modelo de gravedad: {len(_gravity_probs):,} orígenes indexados.")
@@ -560,17 +709,14 @@ def _compute_gravity_model(beta: float = 1.5) -> None:
 # =============================================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Intentamos el camino rápido primero: archivo precompilado (segundos).
-    # Si no existe y hay URL configurada, lo descargamos primero.
-    # Como último recurso, procesamos los CSV crudos (~30 segundos).
     _download_precomputed()
     if not _load_from_precomputed():
         _load_from_csvs()
-    # Si el modelo de gravedad no venía en el archivo precompilado, lo calculamos ahora.
-    # Con ~12 000 paradas tarda unos 10-15 segundos usando numpy vectorizado.
-    if not _gravity_probs:
-        _compute_gravity_model()
-    yield  # El servidor corre normalmente entre el arranque y el cierre
+    # Calibrar beta siempre con los datos cargados, luego recalcular el modelo
+    # con el exponente óptimo (aunque el pkl ya traía un modelo con beta=1.5).
+    _calibrate_beta()
+    _compute_gravity_model(BETA_CALIBRATED)
+    yield
 
 
 # --- Crear la aplicación FastAPI ---------------------------------------------
@@ -602,7 +748,44 @@ app.add_middleware(
 # =============================================================================
 @app.get("/stops")
 def get_stops():
-    return _stops_with_trips  # Simplemente devolvemos la lista ya preparada al inicio
+    # Calculamos la actividad total por parada sumando todos los periodos de tiempo.
+    # Este valor se usa en el frontend para asignar colores y tamaños a los marcadores.
+    stop_total: dict = {}
+    for (sid, _tp), v in _activity.items():
+        stop_total[sid] = stop_total.get(sid, 0) + v["total"]
+    return [
+        {**stop, "total_activity": stop_total.get(stop["stop_id"], 0)}
+        for stop in _stops_with_trips
+    ]
+
+
+# =============================================================================
+# Endpoint: GET /info
+#
+# Devuelve metadatos generales del dataset y el valor de beta calibrado.
+# El frontend usa esto para mostrar "β = X.X (auto-calibrated)" en la tarjeta
+# del modelo de gravedad.
+#
+# Devuelve: {beta_calibrated, total_months, total_stops, total_trips}
+# =============================================================================
+@app.get("/info")
+def get_info():
+    # Número de meses distintos en el dataset (contando las series temporales)
+    all_months: set = set()
+    for ts in _timeseries.values():
+        for entry in ts:
+            all_months.add(entry["month"])
+    total_months = len(all_months)
+
+    # Total de viajes registrados en todos los periodos y paradas
+    total_trips = sum(v["total"] for v in _activity.values())
+
+    return {
+        "beta_calibrated": round(BETA_CALIBRATED, 2),
+        "total_months":    total_months,
+        "total_stops":     len(_stops_lookup),
+        "total_trips":     int(total_trips),
+    }
 
 
 # =============================================================================
@@ -644,7 +827,7 @@ def predict(origin_stop_id: str, time_period: str):
             "probability": prob,  # Número entre 0 y 1 (ej: 0.27 significa 27%)
         }
         for sid, prob in entries
-        if sid in _stops_lookup  # Verificamos que la parada tenga coordenadas antes de incluirla
+        if sid in _stops_lookup and sid != origin_stop_id  # Sin coordenadas ni auto-bucles
     ]
 
 

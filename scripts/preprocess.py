@@ -220,9 +220,80 @@ def main():
     ]
     print(f"    {len(activity):,} registros de actividad, {len(stops_with_trips):,} paradas con viajes")
 
+    # ── Calibración de beta ───────────────────────────────────────
+    # El beta óptimo es el que hace que la distribución de longitudes de viaje
+    # predicha por el modelo de gravedad coincida mejor con la observada en los datos.
+    print("\n[7a/8] Calibrando beta mediante búsqueda en cuadrícula ...")
+    idx_of_cal = {s["stop_id"]: i for i, s in enumerate(stops_with_trips)}
+    n_cal      = len(stops_with_trips)
+    lats_cal_r = np.radians(np.array([stops_lookup[s["stop_id"]]["lat"] for s in stops_with_trips], dtype=np.float64))
+    lons_cal_r = np.radians(np.array([stops_lookup[s["stop_id"]]["lon"] for s in stops_with_trips], dtype=np.float64))
+    R_km_cal   = 6371.0
+
+    # Peso total por parada
+    sw_cal = np.zeros(n_cal, dtype=np.float64)
+    for (sid, _tp), v in activity.items():
+        if sid in idx_of_cal:
+            sw_cal[idx_of_cal[sid]] += v["total"]
+
+    # TLD observada desde od_probs × boardings
+    BIN_MAX_CAL = 50
+    obs_tld_cal = np.zeros(BIN_MAX_CAL, dtype=np.float64)
+    cal_oi, cal_di, cal_t = [], [], []
+    for (origin_id, tp), dests in od_probs.items():
+        if origin_id not in idx_of_cal:
+            continue
+        b = activity.get((origin_id, tp), {}).get("boardings", 0)
+        if b == 0:
+            continue
+        oi = idx_of_cal[origin_id]
+        for dest_id, prob in dests:
+            if dest_id not in idx_of_cal or dest_id == origin_id:
+                continue
+            cal_oi.append(oi); cal_di.append(idx_of_cal[dest_id]); cal_t.append(float(prob) * b)
+
+    beta_calibrated = 1.5
+    best_rmse_c = float("inf")
+    if cal_t:
+        cal_oi_a = np.array(cal_oi); cal_di_a = np.array(cal_di); cal_t_a = np.array(cal_t, dtype=np.float64)
+        dlat_c = lats_cal_r[cal_di_a] - lats_cal_r[cal_oi_a]
+        dlon_c = lons_cal_r[cal_di_a] - lons_cal_r[cal_oi_a]
+        a_c    = np.sin(dlat_c/2)**2 + np.cos(lats_cal_r[cal_oi_a]) * np.cos(lats_cal_r[cal_di_a]) * np.sin(dlon_c/2)**2
+        obs_d  = R_km_cal * 2 * np.arcsin(np.sqrt(np.clip(a_c, 0.0, 1.0)))
+        np.add.at(obs_tld_cal, np.clip(obs_d.astype(int), 0, BIN_MAX_CAL - 1), cal_t_a)
+        if obs_tld_cal.sum() > 0:
+            obs_tld_cal /= obs_tld_cal.sum()
+            MAX_O = min(n_cal, 300)
+            sidxs = np.round(np.linspace(0, n_cal - 1, MAX_O)).astype(int)
+            dlat_m = lats_cal_r[np.newaxis, :] - lats_cal_r[sidxs, np.newaxis]
+            dlon_m = lons_cal_r[np.newaxis, :] - lons_cal_r[sidxs, np.newaxis]
+            a_m    = (np.sin(dlat_m/2)**2 + np.cos(lats_cal_r[sidxs, np.newaxis]) * np.cos(lats_cal_r[np.newaxis, :]) * np.sin(dlon_m/2)**2)
+            dist_m = np.maximum(R_km_cal * 2 * np.arcsin(np.sqrt(np.clip(a_m, 0.0, 1.0))), 0.05)
+            dbins_m = np.clip(dist_m.astype(int), 0, BIN_MAX_CAL - 1)
+            ob_arr  = np.zeros(n_cal, dtype=np.float64)
+            for (sid, _tp), v in activity.items():
+                if sid in idx_of_cal:
+                    ob_arr[idx_of_cal[sid]] += v["boardings"]
+            sboard = ob_arr[sidxs]
+            best_rmse_c = float("inf")
+            for bi in range(50, 301, 10):
+                bt = bi / 100.0
+                sc  = sw_cal[np.newaxis, :] / np.power(dist_m, bt)
+                sc[np.arange(MAX_O), sidxs] = 0.0
+                ts  = sc.sum(axis=1, keepdims=True); vld = ts[:, 0] > 0
+                pm  = np.zeros_like(sc); pm[vld] = sc[vld] / ts[vld]
+                tri = pm * sboard[:, np.newaxis]
+                ptld = np.bincount(dbins_m.ravel(), weights=tri.ravel(), minlength=BIN_MAX_CAL)[:BIN_MAX_CAL]
+                if ptld.sum() > 0: ptld /= ptld.sum()
+                rmse_c = float(np.sqrt(np.mean((obs_tld_cal - ptld)**2)))
+                if rmse_c < best_rmse_c:
+                    best_rmse_c = rmse_c; beta_calibrated = bt
+    rmse_str = f"{best_rmse_c:.4f}" if cal_t else "n/a"
+    print(f"    Beta calibrado: {beta_calibrated} (RMSE: {rmse_str})")
+
     # ── Modelo de gravedad ────────────────────────────────────────
-    print(f"\n[7/8] Calculando modelo de gravedad ...")
-    beta          = 1.5
+    print(f"\n[7/8] Calculando modelo de gravedad (beta={beta_calibrated}) ...")
+    beta          = beta_calibrated
     stop_ids_grav = [s["stop_id"] for s in stops_with_trips]
     n_grav        = len(stop_ids_grav)
     lats_g        = np.array([stops_lookup[sid]["lat"] for sid in stop_ids_grav], dtype=np.float64)
@@ -270,6 +341,7 @@ def main():
         "gravity_probs":    gravity_probs,
         "timeseries":       timeseries,
         "trend":            trend,
+        "beta_calibrated":  beta_calibrated,
     }
     with gzip.open(OUTPUT_PATH, "wb") as f:
         pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)

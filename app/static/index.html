@@ -374,6 +374,35 @@
       line-height: 1.6;
       display: none;
     }
+
+    /* ── Leyenda de actividad (esquina inferior derecha del mapa) ─────────── */
+    .map-legend {
+      background: #1a3a52;
+      border: 1px solid #244f6e;
+      border-left: 3px solid #1e3a8a;
+      border-radius: 6px;
+      padding: 8px 10px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.45);
+      max-width: 190px;
+    }
+    .legend-title {
+      font-size: 0.65rem;
+      text-transform: uppercase;
+      letter-spacing: 1.2px;
+      color: #6da4c4;
+      margin-bottom: 5px;
+    }
+    .legend-items { margin-bottom: 5px; }
+    .legend-item  { display: flex; align-items: center; gap: 6px; margin-bottom: 3px; font-size: 0.68rem; color: #cde0ee; }
+    .legend-dot {
+      display: inline-block;
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      border: 1px solid rgba(255,255,255,0.3);
+      flex-shrink: 0;
+    }
+    .legend-note { font-size: 0.60rem; color: #5a8aaa; line-height: 1.4; }
   </style>
 </head>
 <body>
@@ -529,6 +558,7 @@ const ModelSelectorControl = L.Control.extend({
           <div class="ms-card-icon">🌐</div>
           <div class="ms-card-label">Gravity Model</div>
           <div class="ms-card-sub">Distance × destination activity</div>
+          <div class="ms-card-sub" id="gravity-beta-sub" style="color:#6da4c4;margin-top:2px;"></div>
         </div>
         <div class="ms-card" id="card-trend">
           <div class="ms-card-icon">📈</div>
@@ -592,14 +622,49 @@ const ModelSelectorControl = L.Control.extend({
 });
 new ModelSelectorControl().addTo(map);
 
-// --- Estilos visuales para los marcadores -----------------------------------
-// Definimos tres "looks" diferentes para los círculos del mapa.
-// En vez de repetir estos valores en cada lugar, los guardamos aquí y los
-// reutilizamos. Si quieres cambiar el color de selección, solo cambia aquí.
+// ============================================================================
+// LEYENDA — Control personalizado de Leaflet en la esquina inferior derecha
+//
+// Muestra la escala de colores azules con sus 5 niveles de actividad.
+// El estilo border-left: 3px solid #1e3a8a lo identifica con la paleta azul.
+// ============================================================================
+const LegendControl = L.Control.extend({
+  options: { position: 'bottomright' },
+  onAdd: function() {
+    const div = L.DomUtil.create('div', 'map-legend');
+    div.innerHTML = `
+      <div class="legend-title">Activity</div>
+      <div class="legend-items">
+        <div class="legend-item"><span class="legend-dot" style="background:#1e3a8a"></span> Highest</div>
+        <div class="legend-item"><span class="legend-dot" style="background:#1d4ed8"></span> High</div>
+        <div class="legend-item"><span class="legend-dot" style="background:#3b82f6"></span> Medium</div>
+        <div class="legend-item"><span class="legend-dot" style="background:#93c5fd"></span> Low</div>
+        <div class="legend-item"><span class="legend-dot" style="background:#dbeafe"></span> Lowest</div>
+      </div>
+      <div class="legend-note">Circle size and colour = total boardings + alightings across all 51 months of data</div>
+    `;
+    L.DomEvent.disableClickPropagation(div);
+    return div;
+  }
+});
+new LegendControl().addTo(map);
 
-const STYLE_DEFAULT  = { radius: 4,  fillColor: '#4a9eca', color: '#1a3a52', weight: 1,   fillOpacity: 0.75 };  // Parada normal: círculo azul pequeño
-const STYLE_SELECTED = { radius: 8,  fillColor: '#c2185b', color: '#ffffff', weight: 2,   fillOpacity: 1.0  };  // Parada seleccionada: círculo rosa-rojo más grande
-const STYLE_DEST     = { radius: 5,  fillColor: '#ff7043', color: '#1a3a52', weight: 1,   fillOpacity: 0.85 };  // Estilo reservado para destinos (actualmente no se usa visualmente)
+// --- Estilos visuales para los marcadores -----------------------------------
+// Los marcadores usan una escala de azules basada en actividad total de la parada.
+// Los 5 colores y radios corresponden a bandas de percentil (0-20, 20-40, …, 80-100).
+const ACTIVITY_COLOURS = ['#dbeafe', '#93c5fd', '#3b82f6', '#1d4ed8', '#1e3a8a'];
+const ACTIVITY_RADII   = [3, 4, 5, 6, 8];
+
+const STYLE_DEST = { radius: 5, fillColor: '#ff7043', color: '#1a3a52', weight: 1, fillOpacity: 0.85 };
+
+// Devuelve la banda (0–4) para un valor de actividad dado los umbrales de cuantiles
+function activityBand(activity, thresholds) {
+  if (activity < thresholds[0]) return 0;
+  if (activity < thresholds[1]) return 1;
+  if (activity < thresholds[2]) return 2;
+  if (activity < thresholds[3]) return 3;
+  return 4;
+}
 
 // ============================================================================
 // setModel() — Cambia el modelo de predicción activo
@@ -684,53 +749,56 @@ function updateModelLabel() {
 // del servidor sin bloquear el resto de la página.
 // ============================================================================
 async function init() {
-  // Promise.all lanza las dos peticiones al mismo tiempo y espera a que
-  // ambas terminen. Es más rápido que esperarlas una por una.
-  const [timePeriods, stops] = await Promise.all([
-    fetch(`${API}/time_periods`).then(r => r.json()),  // Pedimos los periodos de tiempo y convertimos la respuesta a objeto JavaScript
-    fetch(`${API}/stops`).then(r => r.json()),          // Pedimos la lista de paradas
+  const [timePeriods, stops, info] = await Promise.all([
+    fetch(`${API}/time_periods`).then(r => r.json()),
+    fetch(`${API}/stops`).then(r => r.json()),
+    fetch(`${API}/info`).then(r => r.json()),
   ]);
 
+  // --- Mostrar beta calibrado en la tarjeta del modelo de gravedad ---------
+  const betaSub = document.getElementById('gravity-beta-sub');
+  if (betaSub && info && info.beta_calibrated != null) {
+    betaSub.textContent = `β = ${info.beta_calibrated} (auto-calibrated)`;
+  }
+
   // --- Llenar el desplegable de periodos de tiempo -------------------------
-  const sel = document.getElementById('time-select');  // Encontramos el elemento <select> en el HTML
+  const sel = document.getElementById('time-select');
   timePeriods.forEach(tp => {
-    const opt = document.createElement('option');  // Creamos una nueva opción del desplegable
-    opt.value = tp;        // El valor interno que se usará al hacer peticiones al servidor
-    opt.textContent = tp;  // El texto visible para el usuario
-    sel.appendChild(opt);  // Añadimos la opción al desplegable
+    const opt = document.createElement('option');
+    opt.value = tp;
+    opt.textContent = tp;
+    sel.appendChild(opt);
   });
 
-  // Escuchamos el evento "change" del desplegable.
-  // Cada vez que el usuario cambia el periodo de tiempo, actualizamos
-  // el mapa de calor y las estadísticas de la parada seleccionada.
-  // Si no hay ninguna parada seleccionada aún, no hacemos nada.
   sel.addEventListener('change', () => {
     if (currentOriginId) fetchAndRender(currentOriginId);
   });
 
+  // --- Calcular umbrales de actividad para la escala de colores azules -----
+  // Ordenamos las actividades de menor a mayor y tomamos los percentiles
+  // 20, 40, 60, 80 como fronteras entre las 5 bandas de color.
+  const sorted = stops.map(s => s.total_activity || 0).sort((a, b) => a - b);
+  const pct = f => sorted[Math.max(0, Math.floor((sorted.length - 1) * f))];
+  const thresholds = [pct(0.20), pct(0.40), pct(0.60), pct(0.80)];
+
   // --- Colocar marcadores en el mapa para cada parada ----------------------
-  // Recorremos la lista de paradas y creamos un marcador circular por cada una.
   stops.forEach(stop => {
-    // L.circleMarker crea un círculo en las coordenadas [lat, lon] con el estilo por defecto.
-    // El operador spread {...STYLE_DEFAULT} copia todas las propiedades del estilo
-    // sin modificar el original.
-    const m = L.circleMarker([stop.lat, stop.lon], { ...STYLE_DEFAULT })
-               .addTo(map);  // Añadimos el marcador al mapa para que sea visible
-
-    // Guardamos los datos de la parada dentro del marcador para acceder a ellos
-    // cuando el usuario haga clic en él.
-    m.stopData = stop;
-
-    // bindTooltip muestra el nombre de la parada al pasar el cursor encima.
-    // sticky:true hace que el tooltip siga al cursor en vez de aparecer fijo.
+    const band = activityBand(stop.total_activity || 0, thresholds);
+    const style = {
+      radius:      ACTIVITY_RADII[band],
+      fillColor:   ACTIVITY_COLOURS[band],
+      color:       '#ffffff',
+      weight:      1,
+      fillOpacity: 0.85,
+    };
+    const m = L.circleMarker([stop.lat, stop.lon], style).addTo(map);
+    m.stopData  = stop;
+    m.stopStyle = style;       // Guardamos el estilo original para restaurarlo al deseleccionar
+    m.stopRadius = style.radius;
     m.bindTooltip(stop.stop_name, { sticky: true, direction: 'top', offset: [0, -4] });
-
-    // Cuando el usuario hace clic en este marcador, llamamos a selectStop
-    // pasando el ID de la parada y el objeto marcador.
     m.on('click', () => selectStop(stop.stop_id, m));
   });
 
-  // Una vez que todo está listo, ocultamos la pantalla de carga.
   document.getElementById('loading').style.display = 'none';
 }
 
@@ -749,17 +817,21 @@ async function init() {
 //   marker — el objeto marcador de Leaflet que fue clicado
 // ============================================================================
 function selectStop(stopId, marker) {
-  // Si ya había una parada seleccionada y es diferente a la nueva,
-  // restauramos su aspecto visual al estilo por defecto (azul, pequeño).
+  // Restaurar el marcador anteriormente seleccionado a su color de actividad original
   if (selectedMarker && selectedMarker !== marker) {
-    selectedMarker.setStyle(STYLE_DEFAULT);
-    selectedMarker.setRadius(STYLE_DEFAULT.radius);  // setRadius cambia el tamaño del círculo
+    selectedMarker.setStyle(selectedMarker.stopStyle);
+    selectedMarker.setRadius(selectedMarker.stopRadius);
   }
 
-  // Aplicamos el estilo de "seleccionado" al nuevo marcador
-  marker.setStyle(STYLE_SELECTED);
-  marker.setRadius(STYLE_SELECTED.radius);  // Lo hacemos más grande para que sea obvio cuál está seleccionado
-  marker.bringToFront();  // Lo traemos al frente para que no quede tapado por otros marcadores
+  // Parada seleccionada: borde rojo (#c2185b) manteniendo el color de actividad original
+  marker.setStyle({
+    fillColor:   marker.stopStyle.fillColor,
+    color:       '#c2185b',
+    weight:      3,
+    fillOpacity: 1.0,
+  });
+  marker.setRadius(8);
+  marker.bringToFront();
 
   // Actualizamos las variables globales con la nueva parada seleccionada
   selectedMarker = marker;
