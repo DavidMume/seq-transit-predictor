@@ -410,5 +410,137 @@ def main():
     print(f"  Pares OD: {len(od_probs):,}")
 
 
+def build_ultra_lite():
+    """
+    Genera data/precomputed_ultralite.pkl.gz — versión mínima para Render free tier.
+
+    Solo contiene:
+      - stops_lookup: stop_id → {name, lat, lon, total_activity}
+      - od_probs:     {(origin_stop_id, time_period): [{stop_id, lat, lon, probability},...]}
+      - time_periods: lista de periodos de tiempo
+
+    No incluye modelo de gravedad, tendencias ni desglose de actividad por periodo.
+    """
+    ULTRALITE_MONTHS = {'202601', '202602', '202603'}
+    ULTRALITE_TOP_N  = 10
+    OUT = DATA_DIR / "precomputed_ultralite.pkl.gz"
+
+    print("=" * 60)
+    print("SEQ Transit Predictor — ultra lite build")
+    print("=" * 60)
+
+    # ── Paradas ───────────────────────────────────────────────────
+    print("\n[1] Cargando stops.txt ...")
+    stops_df = pd.read_csv(
+        DATA_DIR / "stops.txt",
+        usecols=["stop_id", "stop_name", "stop_lat", "stop_lon"],
+        dtype={"stop_id": str},
+    )
+    stops_df["stop_id"]  = stops_df["stop_id"].str.strip()
+    stops_df["stop_lat"] = pd.to_numeric(stops_df["stop_lat"], errors="coerce")
+    stops_df["stop_lon"] = pd.to_numeric(stops_df["stop_lon"], errors="coerce")
+    stops_df = stops_df.dropna(subset=["stop_lat", "stop_lon"])
+    stops_lookup_raw = {
+        row.stop_id: {"name": row.stop_name, "lat": float(row.stop_lat), "lon": float(row.stop_lon)}
+        for row in stops_df.itertuples(index=False)
+    }
+    stops_set = set(stops_lookup_raw)
+    print(f"    {len(stops_lookup_raw):,} paradas cargadas")
+
+    # ── CSVs (3 meses más recientes, todos los operadores) ────────
+    print("\n[2] Leyendo CSVs ...")
+    all_csv = sorted(glob(str(DATA_DIR / "*TL Org-Dest Trips.csv")))
+    csv_files = [f for f in all_csv if any(m in Path(f).name for m in ULTRALITE_MONTHS)]
+    if not csv_files:
+        raise FileNotFoundError(f"No CSV files found for months {ULTRALITE_MONTHS}")
+    print(f"    {len(csv_files)} archivo(s)")
+
+    frames = []
+    for path in csv_files:
+        print(f"    Leyendo {Path(path).name} ...")
+        df = pd.read_csv(
+            path,
+            usecols=["time", "origin_stop", "destination_stop", "quantity"],
+            dtype={"origin_stop": str, "destination_stop": str},
+            low_memory=False,
+        )
+        frames.append(df)
+
+    # ── Limpieza ──────────────────────────────────────────────────
+    print("\n[3] Limpiando y agregando ...")
+    od = pd.concat(frames, ignore_index=True)
+    del frames
+    od["origin_stop"]      = od["origin_stop"].str.strip()
+    od["destination_stop"] = od["destination_stop"].str.strip()
+    od["quantity"]         = pd.to_numeric(od["quantity"], errors="coerce")
+    od = od[od["destination_stop"] != "n/a"]
+    od = od.dropna(subset=["origin_stop", "destination_stop", "quantity"])
+    print(f"    {len(od):,} filas limpias")
+
+    # ── Actividad total por parada (para total_activity en el mapa) ──
+    board_tot  = od.groupby("origin_stop")["quantity"].sum()
+    alight_tot = od.groupby("destination_stop")["quantity"].sum()
+    stop_activity: dict = {}
+    for sid in stops_set:
+        stop_activity[sid] = int(board_tot.get(sid, 0)) + int(alight_tot.get(sid, 0))
+
+    # ── Agregación por periodo de tiempo ──────────────────────────
+    od = (
+        od.groupby(["origin_stop", "time", "destination_stop"], as_index=False)["quantity"]
+        .sum()
+    )
+    time_periods = sorted(od["time"].dropna().unique().tolist())
+
+    # ── Probabilidades (top 10, float32) ─────────────────────────
+    totals = od.groupby(["origin_stop", "time"])["quantity"].sum().rename("total").reset_index()
+    od = od.merge(totals, on=["origin_stop", "time"])
+    od["prob"] = od["quantity"] / od["total"]
+
+    od_valid = od[od["origin_stop"].isin(stops_set) & od["destination_stop"].isin(stops_set)]
+
+    od_probs: dict = {}
+    for (origin, tp), grp in od_valid.groupby(["origin_stop", "time"]):
+        top_rows = grp.nlargest(ULTRALITE_TOP_N, "prob")
+        od_probs[(origin, tp)] = [
+            {
+                "stop_id":     row.destination_stop,
+                "lat":         stops_lookup_raw[row.destination_stop]["lat"],
+                "lon":         stops_lookup_raw[row.destination_stop]["lon"],
+                "probability": float(np.float32(row.prob)),
+            }
+            for row in top_rows.itertuples(index=False)
+        ]
+    print(f"    {len(od_probs):,} pares (origen, periodo) indexados")
+
+    # ── stops_lookup con total_activity ───────────────────────────
+    origin_ids = od_valid["origin_stop"].unique()
+    stops_lookup: dict = {}
+    for sid in origin_ids:
+        if sid not in stops_lookup_raw:
+            continue
+        s = stops_lookup_raw[sid]
+        stops_lookup[sid] = {
+            "name":           s["name"],
+            "lat":            s["lat"],
+            "lon":            s["lon"],
+            "total_activity": stop_activity.get(sid, 0),
+        }
+
+    # ── Guardar ───────────────────────────────────────────────────
+    print(f"\n[4] Guardando en {OUT} ...")
+    payload = {
+        "stops_lookup": stops_lookup,
+        "od_probs":     od_probs,
+        "time_periods": time_periods,
+    }
+    with gzip.open(OUT, "wb") as f:
+        pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+    size_mb = OUT.stat().st_size / 1024 / 1024
+    print(f"\nStops: {len(stops_lookup):,}")
+    print(f"OD pairs: {len(od_probs):,}")
+    print(f"File size: {size_mb:.2f} MB")
+
+
 if __name__ == "__main__":
-    main()
+    build_ultra_lite()

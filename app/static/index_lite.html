@@ -1,0 +1,400 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SEQ Transit Destination Predictor — Live Demo</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+      background: #0d1f2d;
+      color: #dde8f0;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    /* ── Header ─────────────────────────────────────────────────── */
+    #header {
+      background: #1a3a52;
+      padding: 0 20px;
+      height: 48px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-bottom: 2px solid #c2185b;
+      flex-shrink: 0;
+      z-index: 500;
+    }
+    #header-left { display: flex; align-items: center; gap: 12px; }
+    #header h1 { font-size: 0.95rem; font-weight: 700; letter-spacing: 0.5px; color: #fff; }
+
+    /* Colour toggle button */
+    #colour-toggle {
+      background: #0d1f2d;
+      border: 1px solid #244f6e;
+      border-radius: 6px;
+      color: #dde8f0;
+      font-size: 0.78rem;
+      padding: 5px 12px;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: border-color 0.15s, background 0.15s;
+    }
+    #colour-toggle:hover { border-color: #4a9eca; background: #1a3a52; }
+    #colour-toggle.active { border-color: #3b82f6; background: #1e3a8a; color: #fff; }
+
+    /* ── Body ───────────────────────────────────────────────────── */
+    #body { display: flex; flex: 1; overflow: hidden; }
+    #map  { flex: 1; }
+
+    /* ── Sidebar ────────────────────────────────────────────────── */
+    #sidebar {
+      width: 300px;
+      background: #1a3a52;
+      display: flex;
+      flex-direction: column;
+      border-left: 1px solid #244f6e;
+      overflow-y: auto;
+      flex-shrink: 0;
+    }
+    .sb-section { padding: 14px 16px; border-bottom: 1px solid #244f6e; }
+    .sb-label {
+      font-size: 0.68rem;
+      text-transform: uppercase;
+      letter-spacing: 1.2px;
+      color: #6da4c4;
+      margin-bottom: 6px;
+    }
+
+    #stop-name {
+      font-size: 0.95rem;
+      font-weight: 600;
+      color: #fff;
+      min-height: 22px;
+      line-height: 1.3;
+    }
+    #stop-name.placeholder { color: #5a8aaa; font-weight: 400; font-style: italic; }
+
+    #time-select {
+      width: 100%;
+      background: #0d1f2d;
+      color: #dde8f0;
+      border: 1px solid #244f6e;
+      border-radius: 5px;
+      padding: 7px 10px;
+      font-size: 0.82rem;
+      cursor: pointer;
+      appearance: none;
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath fill='%236da4c4' d='M0 0l6 8 6-8z'/%3E%3C/svg%3E");
+      background-repeat: no-repeat;
+      background-position: right 10px center;
+      padding-right: 28px;
+    }
+    #time-select:focus { outline: none; border-color: #c2185b; }
+
+    #dest-section { flex: 1; padding: 14px 16px; }
+    #dest-section .sb-label { margin-bottom: 10px; }
+
+    #hint {
+      font-size: 0.82rem;
+      color: #5a8aaa;
+      text-align: center;
+      padding: 20px 0;
+      line-height: 1.6;
+    }
+
+    .dest-item { margin-bottom: 11px; }
+    .dest-row  { display: flex; align-items: baseline; gap: 6px; margin-bottom: 3px; }
+    .dest-rank { font-size: 0.68rem; color: #6da4c4; min-width: 16px; text-align: right; flex-shrink: 0; }
+    .dest-name { font-size: 0.80rem; color: #cde0ee; flex: 1; line-height: 1.3; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .dest-pct  { font-size: 0.80rem; font-weight: 700; color: #c2185b; flex-shrink: 0; }
+    .bar-bg    { background: #0d1f2d; border-radius: 2px; height: 3px; }
+    .bar-fill  { background: #c2185b; height: 3px; border-radius: 2px; transition: width 0.35s ease; }
+
+    #no-data {
+      font-size: 0.82rem;
+      color: #5a8aaa;
+      text-align: center;
+      padding: 16px 0;
+      display: none;
+    }
+
+    /* ── Loading overlay ────────────────────────────────────────── */
+    #loading {
+      position: fixed; inset: 0;
+      background: rgba(13, 31, 45, 0.96);
+      display: flex; flex-direction: column;
+      align-items: center; justify-content: center;
+      gap: 18px; z-index: 9999;
+    }
+    #loading h2 { color: #dde8f0; font-size: 1.1rem; font-weight: 600; }
+    #loading p  { color: #6da4c4; font-size: 0.88rem; }
+    .spinner {
+      width: 42px; height: 42px;
+      border: 3px solid #244f6e;
+      border-top-color: #c2185b;
+      border-radius: 50%;
+      animation: spin 0.75s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ── Leaflet overrides ──────────────────────────────────────── */
+    .leaflet-container { background: #0d1f2d; }
+    .leaflet-control-zoom a { background: #1a3a52; color: #dde8f0; border-color: #244f6e; }
+    .leaflet-control-zoom a:hover { background: #244f6e; }
+    .leaflet-tooltip {
+      background: #1a3a52; color: #dde8f0;
+      border: 1px solid #244f6e; font-size: 0.75rem;
+      padding: 4px 8px; border-radius: 4px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+    }
+    .leaflet-tooltip::before { display: none; }
+    .leaflet-heatmap-layer { pointer-events: none; }
+    .leaflet-bottom, .leaflet-top { pointer-events: none; }
+    .leaflet-bottom .leaflet-control, .leaflet-top .leaflet-control { pointer-events: auto; }
+
+    /* ── Legend ─────────────────────────────────────────────────── */
+    .map-legend {
+      background: #1a3a52; border: 1px solid #244f6e;
+      border-left: 3px solid #1e3a8a; border-radius: 6px;
+      padding: 7px 9px; box-shadow: 0 2px 8px rgba(0,0,0,0.45);
+    }
+    .legend-title { font-size: 0.62rem; text-transform: uppercase; letter-spacing: 1.1px; color: #6da4c4; margin-bottom: 4px; }
+    .legend-item  { display: flex; align-items: center; gap: 5px; margin-bottom: 2px; font-size: 0.65rem; color: #cde0ee; }
+    .legend-dot   { display: inline-block; width: 8px; height: 8px; border-radius: 50%; border: 1px solid rgba(255,255,255,0.25); flex-shrink: 0; }
+  </style>
+</head>
+<body>
+
+<div id="loading">
+  <div class="spinner"></div>
+  <h2>SEQ Transit Destination Predictor</h2>
+  <p>Loading transit data…</p>
+</div>
+
+<div id="header">
+  <div id="header-left">
+    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <circle cx="12" cy="12" r="10" stroke="#c2185b" stroke-width="2"/>
+      <path d="M12 6v6l4 2" stroke="#c2185b" stroke-width="2" stroke-linecap="round"/>
+      <circle cx="6" cy="18" r="2" fill="#6da4c4"/>
+      <circle cx="18" cy="18" r="2" fill="#6da4c4"/>
+    </svg>
+    <h1>SEQ Transit Destination Predictor — Live Demo</h1>
+  </div>
+  <button id="colour-toggle" class="active">🎨 Colour by activity: ON</button>
+</div>
+
+<div id="body">
+  <div id="map"></div>
+  <div id="sidebar">
+
+    <div class="sb-section">
+      <div class="sb-label">Selected Stop</div>
+      <div id="stop-name" class="placeholder">Click a stop on the map</div>
+    </div>
+
+    <div class="sb-section">
+      <div class="sb-label">Time Period</div>
+      <select id="time-select"></select>
+    </div>
+
+    <div id="dest-section">
+      <div class="sb-label">Top Destinations</div>
+      <div id="hint">Click any stop on the map to see the probability distribution of where travellers are likely to go.</div>
+      <div id="no-data">No trip data for this stop and time period.</div>
+      <div id="dest-list"></div>
+    </div>
+
+  </div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/leaflet.heat@0.2.0/dist/leaflet-heat.js"></script>
+<script>
+'use strict';
+
+const API = '';
+
+const ACTIVITY_COLOURS = ['#dbeafe', '#93c5fd', '#3b82f6', '#1d4ed8', '#1e3a8a'];
+const GREY_COLOUR      = '#94a3b8';
+
+let map, heatLayer;
+let selectedMarker  = null;
+let currentOriginId = null;
+let colourByActivity = true;
+let allMarkers = [];
+
+map = L.map('map', { zoomControl: true, preferCanvas: true })
+       .setView([-27.5, 153.0], 9);
+window._seqMap = map;
+
+L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+  attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>',
+  subdomains: 'abcd',
+  maxZoom: 19,
+}).addTo(map);
+
+// ── Legend ───────────────────────────────────────────────────────
+const LegendControl = L.Control.extend({
+  options: { position: 'bottomright' },
+  onAdd: function () {
+    const div = L.DomUtil.create('div', 'map-legend');
+    div.innerHTML = `
+      <div class="legend-title">Activity</div>
+      <div class="legend-item"><span class="legend-dot" style="background:#1e3a8a"></span> Highest</div>
+      <div class="legend-item"><span class="legend-dot" style="background:#1d4ed8"></span> High</div>
+      <div class="legend-item"><span class="legend-dot" style="background:#3b82f6"></span> Medium</div>
+      <div class="legend-item"><span class="legend-dot" style="background:#93c5fd"></span> Low</div>
+      <div class="legend-item"><span class="legend-dot" style="background:#dbeafe"></span> Lowest</div>
+    `;
+    L.DomEvent.disableClickPropagation(div);
+    return div;
+  }
+});
+new LegendControl().addTo(map);
+
+// ── Colour toggle ────────────────────────────────────────────────
+function activityBand(activity, thresholds) {
+  if (activity < thresholds[0]) return 0;
+  if (activity < thresholds[1]) return 1;
+  if (activity < thresholds[2]) return 2;
+  if (activity < thresholds[3]) return 3;
+  return 4;
+}
+
+document.getElementById('colour-toggle').addEventListener('click', function () {
+  colourByActivity = !colourByActivity;
+  this.textContent = `🎨 Colour by activity: ${colourByActivity ? 'ON' : 'OFF'}`;
+  this.classList.toggle('active', colourByActivity);
+  allMarkers.forEach(m => {
+    if (m === selectedMarker) return;
+    const fill = colourByActivity ? m.activityColour : GREY_COLOUR;
+    m.setStyle({ fillColor: fill });
+    m.stopStyle.fillColor = fill;
+  });
+});
+
+// ── Init ─────────────────────────────────────────────────────────
+async function init() {
+  const [timePeriods, stops] = await Promise.all([
+    fetch(`${API}/time_periods`).then(r => r.json()),
+    fetch(`${API}/stops`).then(r => r.json()),
+  ]);
+
+  // Populate time period dropdown
+  const sel = document.getElementById('time-select');
+  timePeriods.forEach(tp => {
+    const opt = document.createElement('option');
+    opt.value = tp; opt.textContent = tp;
+    sel.appendChild(opt);
+  });
+  sel.addEventListener('change', () => { if (currentOriginId) fetchAndRender(currentOriginId); });
+
+  // Compute activity thresholds for colour scale
+  const sorted = stops.map(s => s.total_activity || 0).sort((a, b) => a - b);
+  const pct = f => sorted[Math.max(0, Math.floor((sorted.length - 1) * f))];
+  const thresholds = [pct(0.20), pct(0.40), pct(0.60), pct(0.80)];
+
+  // Place markers
+  stops.forEach(stop => {
+    const band   = activityBand(stop.total_activity || 0, thresholds);
+    const colour = ACTIVITY_COLOURS[band];
+    const style  = { radius: 4, fillColor: colour, color: '#ffffff', weight: 1, fillOpacity: 0.85 };
+    const m = L.circleMarker([stop.lat, stop.lon], style).addTo(map);
+    m.stopData      = stop;
+    m.activityColour = colour;
+    m.stopStyle     = { ...style };
+    m.stopRadius    = 4;
+    m.bindTooltip(stop.stop_name, { sticky: true, direction: 'top', offset: [0, -4] });
+    m.on('click', () => selectStop(stop.stop_id, m));
+    allMarkers.push(m);
+  });
+
+  document.getElementById('loading').style.display = 'none';
+}
+
+// ── Stop selection ───────────────────────────────────────────────
+function selectStop(stopId, marker) {
+  if (selectedMarker && selectedMarker !== marker) {
+    selectedMarker.setStyle(selectedMarker.stopStyle);
+    selectedMarker.setRadius(selectedMarker.stopRadius);
+  }
+  marker.setStyle({ fillColor: marker.stopStyle.fillColor, color: '#c2185b', weight: 3, fillOpacity: 1.0 });
+  marker.setRadius(8);
+  marker.bringToFront();
+  selectedMarker  = marker;
+  currentOriginId = stopId;
+
+  const nameEl = document.getElementById('stop-name');
+  nameEl.textContent = marker.stopData.stop_name;
+  nameEl.classList.remove('placeholder');
+
+  fetchAndRender(stopId);
+}
+
+// ── Fetch and render ─────────────────────────────────────────────
+async function fetchAndRender(stopId) {
+  const timePeriod  = document.getElementById('time-select').value;
+  const predictUrl  = `${API}/predict?origin_stop_id=${encodeURIComponent(stopId)}&time_period=${encodeURIComponent(timePeriod)}`;
+
+  let destinations;
+  try {
+    destinations = await fetch(predictUrl).then(r => r.json());
+  } catch (err) {
+    console.error('Fetch failed:', err);
+    return;
+  }
+
+  if (heatLayer) { map.removeLayer(heatLayer); heatLayer = null; }
+
+  const noDataEl   = document.getElementById('no-data');
+  const hintEl     = document.getElementById('hint');
+  const destListEl = document.getElementById('dest-list');
+  hintEl.style.display  = 'none';
+  destListEl.innerHTML  = '';
+
+  if (!destinations || destinations.length === 0) {
+    noDataEl.style.display = 'block';
+    return;
+  }
+  noDataEl.style.display = 'none';
+
+  const maxProb   = destinations[0].probability;
+  const heatPoints = destinations.map(d => [d.lat, d.lon, d.probability / maxProb]);
+
+  heatLayer = L.heatLayer(heatPoints, {
+    radius: 25, blur: 20, maxZoom: 9, minOpacity: 0.4, max: 1.0,
+    gradient: { 0.0: '#1565c0', 0.3: '#7b1fa2', 0.6: '#c2185b', 0.85: '#ff5722', 1.0: '#ffeb3b' }
+  }).addTo(map);
+
+  const top10   = destinations.slice(0, 10);
+  const topProb = top10[0].probability;
+  destListEl.innerHTML = top10.map((d, i) => `
+    <div class="dest-item">
+      <div class="dest-row">
+        <span class="dest-rank">${i + 1}.</span>
+        <span class="dest-name" title="${d.stop_name}">${d.stop_name}</span>
+        <span class="dest-pct">${(d.probability * 100).toFixed(1)}%</span>
+      </div>
+      <div class="bar-bg">
+        <div class="bar-fill" style="width:${(d.probability / topProb * 100).toFixed(1)}%"></div>
+      </div>
+    </div>
+  `).join('');
+}
+
+init().catch(err => {
+  document.getElementById('loading').innerHTML = `
+    <h2 style="color:#c2185b;">Failed to load</h2>
+    <p>${err.message || 'Could not connect to backend.'}</p>
+  `;
+});
+</script>
+</body>
+</html>
