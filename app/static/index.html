@@ -233,13 +233,13 @@
 
     /* ── Selector de modelo (tarjeta flotante, esquina inferior izquierda) ── */
     .model-selector {
+      position: relative;         /* necesario para que el tooltip use absolute dentro de este contenedor */
       background: #1a3a52;
       border: 1px solid #244f6e;
       border-radius: 8px;
       padding: 10px 12px;
       min-width: 230px;
       box-shadow: 0 4px 16px rgba(0,0,0,0.5);
-      /* Leaflet le asigna z-index automáticamente al control */
     }
     .ms-title {
       font-size: 0.65rem;
@@ -250,6 +250,7 @@
     }
     .ms-cards { display: flex; gap: 8px; }
     .ms-card {
+      position: relative;         /* necesario para posicionar el botón ⓘ en la esquina */
       flex: 1;
       padding: 8px 10px;
       border-radius: 6px;
@@ -271,6 +272,46 @@
     .ms-card-icon  { font-size: 1.2rem; margin-bottom: 3px; }
     .ms-card-label { font-size: 0.78rem; font-weight: 600; }
     .ms-card-sub   { font-size: 0.63rem; opacity: 0.8; line-height: 1.3; margin-top: 2px; }
+
+    /* Botón de información ⓘ en la esquina superior derecha de cada tarjeta */
+    .ms-info-btn {
+      position: absolute;
+      top: 4px;
+      right: 4px;
+      width: 15px;
+      height: 15px;
+      border-radius: 50%;
+      border: 1px solid rgba(255,255,255,0.25);
+      background: transparent;
+      color: inherit;
+      font-size: 10px;
+      line-height: 15px;
+      text-align: center;
+      cursor: pointer;
+      opacity: 0.6;
+      transition: opacity 0.15s, background 0.15s;
+      padding: 0;
+    }
+    .ms-info-btn:hover { opacity: 1; background: rgba(255,255,255,0.15); }
+
+    /* Tooltip que aparece encima del panel selector cuando se pulsa ⓘ */
+    #ms-tooltip-popup {
+      display: none;
+      position: absolute;
+      bottom: calc(100% + 8px);
+      left: 0;
+      right: 0;
+      background: #0d1f2d;
+      border: 1px solid #4a9eca;
+      border-radius: 6px;
+      padding: 10px 12px;
+      font-size: 0.72rem;
+      color: #cde0ee;
+      line-height: 1.55;
+      box-shadow: 0 4px 16px rgba(0,0,0,0.6);
+      pointer-events: none;
+    }
+    #ms-tooltip-popup.visible { display: block; }
 
     /* Etiqueta del modelo activo debajo del nombre de parada */
     #model-label {
@@ -474,14 +515,17 @@ const ModelSelectorControl = L.Control.extend({
   onAdd: function () {
     const div = L.DomUtil.create('div', 'model-selector');
     div.innerHTML = `
+      <div id="ms-tooltip-popup"></div>
       <div class="ms-title">Prediction Model</div>
       <div class="ms-cards">
         <div class="ms-card active" id="card-empirical">
+          <button class="ms-info-btn" id="info-empirical">ⓘ</button>
           <div class="ms-card-icon">📊</div>
           <div class="ms-card-label">Empirical</div>
           <div class="ms-card-sub">Based on observed trips</div>
         </div>
         <div class="ms-card" id="card-gravity">
+          <button class="ms-info-btn" id="info-gravity">ⓘ</button>
           <div class="ms-card-icon">🌐</div>
           <div class="ms-card-label">Gravity Model</div>
           <div class="ms-card-sub">Distance × destination activity</div>
@@ -495,10 +539,54 @@ const ModelSelectorControl = L.Control.extend({
     `;
     // Evitamos que los clics en el control lleguen al mapa (evita zoom accidental)
     L.DomEvent.disableClickPropagation(div);
-    // Asignamos los handlers de click a cada tarjeta
+
+    // ── Handlers de selección de modelo ───────────────────────────────────
     div.querySelector('#card-empirical').addEventListener('click', () => setModel('empirical'));
     div.querySelector('#card-gravity').addEventListener('click', () => setModel('gravity'));
     div.querySelector('#card-trend').addEventListener('click', () => setModel('trend'));
+
+    // ── Lógica del tooltip de información ─────────────────────────────────
+    // Texto explicativo para cada modelo (solo los dos primeros tienen ⓘ)
+    const MS_TOOLTIPS = {
+      empirical: 'Shows where people actually travelled based on 4 years of Translink trip records. Reflects real behaviour including service quality, habits and network structure.',
+      gravity:   'Estimates destination probability based on stop size (boardings + alightings) and straight-line distance. Uses a simplified gravity equation — does not account for actual travel times, service frequency or transfers. Best used to compare with empirical patterns.'
+    };
+    let msActiveTooltip = null;
+
+    // Muestra u oculta el tooltip: si ya está abierto para ese botón, lo cierra
+    function toggleMsTooltip(id) {
+      const popup = div.querySelector('#ms-tooltip-popup');
+      if (msActiveTooltip === id) {
+        popup.classList.remove('visible');
+        msActiveTooltip = null;
+      } else {
+        popup.textContent = MS_TOOLTIPS[id];
+        popup.classList.add('visible');
+        msActiveTooltip = id;
+      }
+    }
+
+    // stopPropagation evita que el clic en ⓘ también dispare el handler de la tarjeta
+    div.querySelector('#info-empirical').addEventListener('click', e => {
+      e.stopPropagation();
+      toggleMsTooltip('empirical');
+    });
+    div.querySelector('#info-gravity').addEventListener('click', e => {
+      e.stopPropagation();
+      toggleMsTooltip('gravity');
+    });
+
+    // Cerrar el tooltip al hacer clic en cualquier parte del panel (pero no en ⓘ)
+    div.addEventListener('click', () => {
+      div.querySelector('#ms-tooltip-popup').classList.remove('visible');
+      msActiveTooltip = null;
+    });
+
+    // Cerrar el tooltip al hacer clic en el mapa
+    map.on('click', () => {
+      div.querySelector('#ms-tooltip-popup').classList.remove('visible');
+      msActiveTooltip = null;
+    });
     return div;
   }
 });
