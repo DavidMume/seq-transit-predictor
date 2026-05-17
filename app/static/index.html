@@ -414,6 +414,11 @@
   <p>Loading transit data — this may take 10–20 seconds…</p>
 </div>
 
+<!-- Lite mode banner (hidden by default, shown when server reports lite_mode=true) -->
+<div id="lite-banner" style="display:none;background:#0d2a3d;border-bottom:1px solid #4a9eca;padding:5px 20px;font-size:0.76rem;color:#93c5fd;text-align:center;flex-shrink:0;letter-spacing:0.3px;">
+  Lite version — full version with 51 months of data and trend analysis available locally
+</div>
+
 <!-- Header -->
 <div id="header">
   <svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
@@ -755,10 +760,20 @@ async function init() {
     fetch(`${API}/info`).then(r => r.json()),
   ]);
 
-  // --- Mostrar beta calibrado en la tarjeta del modelo de gravedad ---------
+  // --- Aplicar ajustes de modo lite si corresponde ------------------------
+  if (info && info.lite_mode) {
+    document.getElementById('lite-banner').style.display = 'block';
+    document.getElementById('card-trend').style.display  = 'none';
+    // Si el modelo activo era Trend, reseteamos a Empirical
+    if (currentModel === 'trend') setModel('empirical');
+  }
+
+  // --- Mostrar beta en la tarjeta del modelo de gravedad ------------------
   const betaSub = document.getElementById('gravity-beta-sub');
-  if (betaSub && info && info.beta_calibrated != null) {
-    betaSub.textContent = `β = ${info.beta_calibrated} (auto-calibrated)`;
+  if (betaSub && info) {
+    betaSub.textContent = info.lite_mode
+      ? 'β = 2.0 (fixed)'
+      : `β = ${info.beta_calibrated} (auto-calibrated)`;
   }
 
   // --- Llenar el desplegable de periodos de tiempo -------------------------

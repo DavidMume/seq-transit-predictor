@@ -38,11 +38,15 @@ log = logging.getLogger(__name__)  # Creamos un "diario" específico para este a
 # --- Rutas de carpetas -------------------------------------------------------
 # Path(__file__) es la ruta de este mismo archivo (main.py).
 # .parent sube un nivel en la carpeta, como hacer "cd .." en la terminal.
-DATA_DIR = Path(__file__).parent.parent / "data"    # Carpeta donde están los CSV y stops.txt
-STATIC_DIR = Path(__file__).parent / "static"       # Carpeta donde está el archivo index.html
+DATA_DIR   = Path(__file__).parent.parent / "data"   # Carpeta donde están los CSV y stops.txt
+STATIC_DIR = Path(__file__).parent / "static"        # Carpeta donde está el archivo index.html
 
-# Ruta del archivo precompilado. Si existe, el servidor arranca en segundos en vez de 30 segundos.
-PRECOMPUTED_PATH = DATA_DIR / "precomputed.pkl.gz"
+# Lite mode: versión reducida para servidores con 512 MB de RAM (ej. Render free tier).
+# Se activa con la variable de entorno LITE_MODE=true.
+LITE_MODE = os.getenv("LITE_MODE", "false").lower() == "true"
+
+# Ruta del archivo precompilado — lite usa un archivo más pequeño con 6 meses de datos.
+PRECOMPUTED_PATH = DATA_DIR / ("precomputed_lite.pkl.gz" if LITE_MODE else "precomputed.pkl.gz")
 
 # URL de descarga del archivo precompilado. Se configura como variable de entorno en producción.
 # Si no está configurada, el servidor intentará leer los CSV crudos desde DATA_DIR.
@@ -709,13 +713,18 @@ def _compute_gravity_model(beta: float = 1.5) -> None:
 # =============================================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global BETA_CALIBRATED
     _download_precomputed()
     if not _load_from_precomputed():
         _load_from_csvs()
-    # Calibrar beta siempre con los datos cargados, luego recalcular el modelo
-    # con el exponente óptimo (aunque el pkl ya traía un modelo con beta=1.5).
-    _calibrate_beta()
-    _compute_gravity_model(BETA_CALIBRATED)
+    if LITE_MODE:
+        # Modo lite: beta fijo, modelo de gravedad ya viene en el pkl precompilado.
+        BETA_CALIBRATED = 2.0
+        log.info(f"Modo lite activo — β fijo = {BETA_CALIBRATED}, modelo de gravedad cargado desde pkl.")
+    else:
+        # Modo completo: calibrar beta y recalcular el modelo de gravedad con el valor óptimo.
+        _calibrate_beta()
+        _compute_gravity_model(BETA_CALIBRATED)
     yield
 
 
@@ -785,6 +794,7 @@ def get_info():
         "total_months":    total_months,
         "total_stops":     len(_stops_lookup),
         "total_trips":     int(total_trips),
+        "lite_mode":       LITE_MODE,
     }
 
 

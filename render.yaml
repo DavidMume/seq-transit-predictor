@@ -7,3 +7,5 @@ services:
     envVars:
       - key: DATA_DOWNLOAD_URL
         sync: false
+      - key: LITE_MODE
+        value: true
