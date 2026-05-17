@@ -291,8 +291,48 @@
       line-height: 1.4;
     }
 
-    /* Aspecto desactivado del desplegable de periodo en modo gravedad */
+    /* Aspecto desactivado del desplegable de periodo en modo gravedad/tendencia */
     #time-select:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    /* ── Sección de Tendencia (reemplaza dest-section en modo Trend) ──────── */
+    #trend-section { display: none; padding: 14px 16px; flex: 1; overflow-y: auto; }
+
+    /* Contenedor del gráfico SVG */
+    #trend-chart { margin-bottom: 12px; }
+    #trend-chart svg { display: block; }
+
+    /* Insignia de tendencia: Growing / Declining / Stable */
+    #trend-badge {
+      font-size: 0.95rem;
+      font-weight: 700;
+      margin-bottom: 5px;
+      min-height: 22px;
+    }
+
+    /* Texto de interpretación en lenguaje natural */
+    #trend-interpretation {
+      font-size: 0.80rem;
+      color: #cde0ee;
+      line-height: 1.5;
+      margin-bottom: 8px;
+    }
+
+    /* Nota de R² al pie de la sección */
+    #trend-rsquared {
+      font-size: 0.70rem;
+      color: #5a8aaa;
+      font-style: italic;
+    }
+
+    /* Mensaje cuando no hay datos de tendencia para una parada */
+    #trend-no-data {
+      font-size: 0.82rem;
+      color: #5a8aaa;
+      text-align: center;
+      padding: 24px 0;
+      line-height: 1.6;
+      display: none;
+    }
   </style>
 </head>
 <body>
@@ -359,6 +399,16 @@
       <div id="hint">Click any stop marker on the map to see the probability distribution of where travellers are likely to go.</div>
       <div id="no-data">No trip data for this stop and time period.</div>
       <div id="dest-list"></div>
+    </div>
+
+    <!-- Sección de tendencia: visible solo en modo Trend -->
+    <div id="trend-section">
+      <div class="sb-label">Activity Over Time</div>
+      <div id="trend-no-data">Click a stop to see its activity trend over time.</div>
+      <div id="trend-chart"></div>
+      <div id="trend-badge"></div>
+      <div id="trend-interpretation"></div>
+      <div id="trend-rsquared"></div>
     </div>
 
   </div>
@@ -436,6 +486,11 @@ const ModelSelectorControl = L.Control.extend({
           <div class="ms-card-label">Gravity Model</div>
           <div class="ms-card-sub">Distance × destination activity</div>
         </div>
+        <div class="ms-card" id="card-trend">
+          <div class="ms-card-icon">📈</div>
+          <div class="ms-card-label">Trend</div>
+          <div class="ms-card-sub">Activity over time + forecast</div>
+        </div>
       </div>
     `;
     // Evitamos que los clics en el control lleguen al mapa (evita zoom accidental)
@@ -443,6 +498,7 @@ const ModelSelectorControl = L.Control.extend({
     // Asignamos los handlers de click a cada tarjeta
     div.querySelector('#card-empirical').addEventListener('click', () => setModel('empirical'));
     div.querySelector('#card-gravity').addEventListener('click', () => setModel('gravity'));
+    div.querySelector('#card-trend').addEventListener('click', () => setModel('trend'));
     return div;
   }
 });
@@ -474,23 +530,42 @@ function setModel(model) {
   // Actualizamos el aspecto visual de las tarjetas: activa = rosa, inactiva = oscuro
   document.getElementById('card-empirical').classList.toggle('active', model === 'empirical');
   document.getElementById('card-gravity').classList.toggle('active', model === 'gravity');
+  document.getElementById('card-trend').classList.toggle('active', model === 'trend');
 
-  // El desplegable de periodo de tiempo solo tiene sentido en el modelo empírico.
-  // En modo gravedad lo desactivamos visualmente y mostramos una nota explicativa.
-  const sel = document.getElementById('time-select');
+  const sel         = document.getElementById('time-select');
   const gravityNote = document.getElementById('gravity-note');
-  if (model === 'gravity') {
+  const destSection = document.getElementById('dest-section');
+  const trendSection = document.getElementById('trend-section');
+  const actSection  = document.getElementById('activity-section');
+
+  if (model === 'trend') {
+    // En modo Tendencia: desactivamos periodo, ocultamos heatmap y lista de destinos,
+    // mostramos el panel de la gráfica de serie temporal.
     sel.disabled = true;
-    gravityNote.style.display = 'block';
-  } else {
-    sel.disabled = false;
     gravityNote.style.display = 'none';
+    destSection.style.display  = 'none';
+    actSection.style.display   = 'none';
+    trendSection.style.display = 'flex';
+    trendSection.style.flexDirection = 'column';
+    // Ocultamos el mapa de calor si está activo
+    if (heatLayer) { map.removeLayer(heatLayer); heatLayer = null; }
+  } else {
+    // En cualquier otro modo: restauramos la lista de destinos y ocultamos el panel de tendencia
+    trendSection.style.display = 'none';
+    destSection.style.display  = '';
+    if (model === 'gravity') {
+      sel.disabled = true;
+      gravityNote.style.display = 'block';
+    } else {
+      sel.disabled = false;
+      gravityNote.style.display = 'none';
+    }
   }
 
   // Actualizamos la etiqueta de modelo en el panel lateral
   updateModelLabel();
 
-  // Si hay una parada seleccionada, recargamos el mapa de calor con el nuevo modelo
+  // Si hay una parada seleccionada, recargamos con el nuevo modelo
   if (currentOriginId) fetchAndRender(currentOriginId);
 }
 
@@ -500,9 +575,13 @@ function setModel(model) {
 function updateModelLabel() {
   const el = document.getElementById('model-label');
   if (!currentOriginId) { el.textContent = ''; return; }
-  el.textContent = currentModel === 'empirical'
-    ? 'Based on 6 months of observed trips'
-    : 'Based on distance × destination activity';
+  if (currentModel === 'empirical') {
+    el.textContent = 'Based on 4+ years of observed trips';
+  } else if (currentModel === 'gravity') {
+    el.textContent = 'Based on distance × destination activity';
+  } else {
+    el.textContent = 'Monthly activity Jan 2022 – Mar 2026';
+  }
 }
 
 // ============================================================================
@@ -625,6 +704,12 @@ function selectStop(stopId, marker) {
 //   stopId — el ID de la parada de origen
 // ============================================================================
 async function fetchAndRender(stopId) {
+  // El modo Tendencia tiene su propia función de renderizado — no usa heatmap
+  if (currentModel === 'trend') {
+    fetchAndRenderTrend(stopId);
+    return;
+  }
+
   // Leemos el periodo de tiempo seleccionado en el desplegable en este momento
   const timePeriod = document.getElementById('time-select').value;
 
@@ -764,6 +849,201 @@ function renderActivity(data, timePeriod) {
 
   // Mostramos la sección (estaba oculta con display:none hasta tener datos)
   section.style.display = 'block';
+}
+
+// ============================================================================
+// fetchAndRenderTrend() — Pide los datos de tendencia al servidor y los muestra
+//
+// Se llama cuando el usuario hace clic en una parada en modo Trend.
+// Pide el endpoint /trend que devuelve la serie temporal completa y la
+// regresión lineal, y los pasa a las funciones de renderizado.
+// ============================================================================
+async function fetchAndRenderTrend(stopId) {
+  const noData = document.getElementById('trend-no-data');
+  const chart  = document.getElementById('trend-chart');
+
+  // Limpiamos contenido anterior mientras esperamos la respuesta
+  chart.innerHTML = '';
+  document.getElementById('trend-badge').textContent          = '';
+  document.getElementById('trend-interpretation').textContent = '';
+  document.getElementById('trend-rsquared').textContent       = '';
+  noData.style.display = 'none';
+
+  let data;
+  try {
+    data = await fetch(`${API}/trend?stop_id=${encodeURIComponent(stopId)}`).then(r => r.json());
+  } catch (err) {
+    console.error('Trend fetch failed:', err);
+    return;
+  }
+
+  // Si el servidor no devuelve datos, mostramos un mensaje
+  if (!data || !data.timeseries || data.timeseries.length === 0) {
+    noData.style.display = 'block';
+    noData.textContent   = 'No hay datos de serie temporal para esta parada.';
+    return;
+  }
+
+  renderTrendChart(data.timeseries, data.trend);
+  renderTrendSummary(data.trend);
+}
+
+// ============================================================================
+// renderTrendChart() — Dibuja el gráfico de serie temporal en SVG
+//
+// SVG es un formato de gráficos vectoriales que podemos generar directamente
+// como texto HTML. No necesitamos ninguna librería externa — construimos
+// las líneas, puntos y etiquetas del gráfico con elementos SVG básicos.
+//
+// El gráfico muestra:
+//   - Línea histórica (rosa) de todos los meses del dataset
+//   - Línea de proyección a 3 meses (azul discontinuo)
+//   - Relleno suave debajo de la línea histórica
+//   - Ejes y etiquetas de tiempo (cada 6 meses en el eje X)
+// ============================================================================
+function renderTrendChart(timeseries, trend) {
+  const container = document.getElementById('trend-chart');
+
+  // Dimensiones del gráfico SVG (en píxeles)
+  const SVG_W = 278, SVG_H = 172;
+  const PAD   = { top: 8, right: 8, bottom: 30, left: 46 };
+  const W     = SVG_W - PAD.left - PAD.right;   // Ancho del área de trazado
+  const H     = SVG_H - PAD.top  - PAD.bottom;  // Alto del área de trazado
+
+  const proj    = (trend && trend.projection_3m) ? trend.projection_3m : [];
+  const n       = timeseries.length;
+  const nTotal  = n + proj.length;
+
+  // Escala Y: de 0 hasta el máximo con un 10% extra de margen superior
+  const maxVal  = Math.max(...timeseries.map(d => d.total), ...proj.map(d => d.projected_total), 1) * 1.10;
+
+  // Funciones de escalado: convierten valores de datos a coordenadas de píxeles en el SVG
+  const xOf = i => PAD.left + (i / Math.max(nTotal - 1, 1)) * W;
+  const yOf = v => PAD.top  + H - (v / maxVal) * H;
+
+  // ── Puntos del gráfico ────────────────────────────────────────
+  const histPts = timeseries.map((d, i) => `${xOf(i).toFixed(1)},${yOf(d.total).toFixed(1)}`).join(' ');
+  const projPts = [
+    `${xOf(n-1).toFixed(1)},${yOf(timeseries[n-1].total).toFixed(1)}`,  // Conecta desde el último dato real
+    ...proj.map((d, i) => `${xOf(n+i).toFixed(1)},${yOf(d.projected_total).toFixed(1)}`)
+  ].join(' ');
+
+  // ── Etiquetas del eje X: cada 6 meses ─────────────────────────
+  const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  const fmtM   = s => { const [y,m] = s.split('-'); return `${MONTHS[+m-1]} '${y.slice(2)}`; };
+  const xLabels = [];
+  for (let i = 0; i < n; i += 6) xLabels.push({ i, txt: fmtM(timeseries[i].month) });
+
+  // ── Etiquetas del eje Y: 4 marcas ─────────────────────────────
+  const fmtY  = v => v >= 1e6 ? (v/1e6).toFixed(1)+'M' : v >= 1e4 ? Math.round(v/1e3)+'k' : v >= 1e3 ? (v/1e3).toFixed(1)+'k' : String(Math.round(v));
+  const yTicks = [0, 0.25, 0.5, 0.75, 1.0].map(f => ({ v: maxVal * f, y: yOf(maxVal * f) }));
+
+  // ── Construcción del SVG como cadena de texto ─────────────────
+  // Usamos un template literal de JavaScript para generar el HTML del SVG.
+  let svg = `<svg viewBox="0 0 ${SVG_W} ${SVG_H}" width="100%" xmlns="http://www.w3.org/2000/svg">`;
+
+  // Líneas de cuadrícula horizontales (una por cada marca del eje Y)
+  yTicks.forEach(t => {
+    svg += `<line x1="${PAD.left}" y1="${t.y.toFixed(1)}" x2="${SVG_W - PAD.right}" y2="${t.y.toFixed(1)}" stroke="#244f6e" stroke-width="1" opacity="0.5"/>`;
+  });
+
+  // Ejes (línea vertical izquierda y línea horizontal inferior)
+  svg += `<line x1="${PAD.left}" y1="${PAD.top}" x2="${PAD.left}" y2="${PAD.top+H}" stroke="#4a6a82" stroke-width="1.5"/>`;
+  svg += `<line x1="${PAD.left}" y1="${PAD.top+H}" x2="${SVG_W-PAD.right}" y2="${PAD.top+H}" stroke="#4a6a82" stroke-width="1.5"/>`;
+
+  // Etiquetas del eje Y
+  yTicks.filter(t => t.v > 0).forEach(t => {
+    svg += `<text x="${PAD.left-4}" y="${(t.y+3.5).toFixed(1)}" text-anchor="end" fill="#6da4c4" font-size="9" font-family="system-ui,sans-serif">${fmtY(Math.round(t.v))}</text>`;
+  });
+
+  // Etiquetas del eje X (cada 6 meses)
+  xLabels.forEach(({ i, txt }) => {
+    svg += `<text x="${xOf(i).toFixed(1)}" y="${PAD.top+H+18}" text-anchor="middle" fill="#6da4c4" font-size="9" font-family="system-ui,sans-serif">${txt}</text>`;
+  });
+
+  // Relleno suave bajo la línea histórica (área sombreada)
+  const areaPath = `M${xOf(0).toFixed(1)},${(PAD.top+H)} `
+    + timeseries.map((d,i) => `L${xOf(i).toFixed(1)},${yOf(d.total).toFixed(1)}`).join(' ')
+    + ` L${xOf(n-1).toFixed(1)},${(PAD.top+H)} Z`;
+  svg += `<path d="${areaPath}" fill="#c2185b" fill-opacity="0.09"/>`;
+
+  // Línea histórica (rosa, continua)
+  svg += `<polyline points="${histPts}" fill="none" stroke="#c2185b" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`;
+
+  // Línea de proyección (azul claro, discontinua)
+  if (proj.length > 0) {
+    svg += `<polyline points="${projPts}" fill="none" stroke="#4a9eca" stroke-width="1.8" stroke-dasharray="5,3" stroke-linejoin="round"/>`;
+    // Etiqueta "Projected" junto al primer punto de proyección
+    const px = xOf(n).toFixed(1);
+    const py = (yOf(proj[0].projected_total) - 7).toFixed(1);
+    svg += `<text x="${px}" y="${py}" text-anchor="middle" fill="#4a9eca" font-size="8" font-family="system-ui,sans-serif">Projected</text>`;
+  }
+
+  // Puntos pequeños en cada dato histórico
+  timeseries.forEach((d, i) => {
+    svg += `<circle cx="${xOf(i).toFixed(1)}" cy="${yOf(d.total).toFixed(1)}" r="1.5" fill="#c2185b"/>`;
+  });
+
+  // Punto más grande en el último dato real (marca la transición a proyección)
+  svg += `<circle cx="${xOf(n-1).toFixed(1)}" cy="${yOf(timeseries[n-1].total).toFixed(1)}" r="3.5" fill="#c2185b" stroke="#0d1f2d" stroke-width="1.5"/>`;
+
+  svg += '</svg>';
+  container.innerHTML = svg;
+}
+
+// ============================================================================
+// renderTrendSummary() — Muestra la insignia de tendencia, interpretación y R²
+//
+// Lee el resultado de la regresión lineal y lo traduce a texto comprensible.
+// La pendiente (slope) indica cuántos viajes se ganan o pierden por mes.
+// R² indica la confiabilidad de esa tendencia: cerca de 1 = muy confiable.
+// ============================================================================
+function renderTrendSummary(trend) {
+  const badgeEl  = document.getElementById('trend-badge');
+  const interpEl = document.getElementById('trend-interpretation');
+  const r2El     = document.getElementById('trend-rsquared');
+
+  if (!trend) {
+    badgeEl.textContent  = '';
+    interpEl.textContent = 'Insufficient data for trend analysis.';
+    r2El.textContent     = '';
+    return;
+  }
+
+  const { slope, direction, r_squared } = trend;
+
+  // ── Insignia de tendencia ─────────────────────────────────────
+  // Si R² es bajo, la tendencia no es estadísticamente confiable → mostramos "Stable"
+  let badgeText, badgeColor;
+  if (r_squared < 0.3) {
+    badgeText  = '➡️ Stable';
+    badgeColor = '#8a9bb0';
+  } else if (direction === 'growing') {
+    badgeText  = '📈 Growing';
+    badgeColor = '#4caf50';
+  } else if (direction === 'declining') {
+    badgeText  = '📉 Declining';
+    badgeColor = '#ef5350';
+  } else {
+    badgeText  = '➡️ Stable';
+    badgeColor = '#8a9bb0';
+  }
+  badgeEl.textContent  = badgeText;
+  badgeEl.style.color  = badgeColor;
+
+  // ── Texto de interpretación ───────────────────────────────────
+  const absSlope = Math.round(Math.abs(slope)).toLocaleString();
+  if (direction === 'stable' || r_squared < 0.3) {
+    interpEl.textContent = 'Activity has remained relatively stable';
+  } else if (direction === 'growing') {
+    interpEl.textContent = `Activity up ~${absSlope} trips/month on average`;
+  } else {
+    interpEl.textContent = `Activity down ~${absSlope} trips/month on average`;
+  }
+
+  // ── Nota de R² con nivel de confianza ─────────────────────────
+  const confidence = r_squared < 0.3 ? 'low' : r_squared < 0.6 ? 'moderate' : 'high';
+  r2El.textContent = `R² = ${r_squared.toFixed(2)} — ${confidence} confidence`;
 }
 
 // ============================================================================

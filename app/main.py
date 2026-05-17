@@ -59,6 +59,8 @@ _activity: dict = {}         # Diccionario: (stop_id, periodo) → {subidas, baj
 _time_periods: list = []     # Lista con los nombres de los periodos de tiempo disponibles (ej: "Weekday (8:30am-2:59:59pm)")
 _stops_with_trips: list = [] # Lista de paradas que tienen al menos un viaje registrado — las que aparecen en el mapa
 _gravity_probs: dict = {}    # Diccionario: stop_id → lista de {stop_id, stop_name, lat, lon, probability} según modelo de gravedad
+_timeseries: dict = {}       # Diccionario: stop_id → lista cronológica de {month, boardings, alightings, total} por cada mes del dataset
+_trend: dict = {}            # Diccionario: stop_id → {slope, direction, projection_3m, r_squared} de la regresión lineal
 
 
 # =============================================================================
@@ -86,7 +88,7 @@ def _download_precomputed() -> None:
 # memoria en segundos. Devuelve True si tuvo éxito, False si no existe el archivo.
 # =============================================================================
 def _load_from_precomputed() -> bool:
-    global _stops_lookup, _od_probs, _activity, _time_periods, _stops_with_trips, _gravity_probs
+    global _stops_lookup, _od_probs, _activity, _time_periods, _stops_with_trips, _gravity_probs, _timeseries, _trend
     if not PRECOMPUTED_PATH.exists():
         return False
     log.info(f"Cargando datos precompilados desde {PRECOMPUTED_PATH} ...")
@@ -97,15 +99,143 @@ def _load_from_precomputed() -> bool:
     _activity = payload["activity"]
     _time_periods = payload["time_periods"]
     _stops_with_trips = payload["stops_with_trips"]
-    # gravity_probs es opcional — archivos generados antes de esta versión no lo tienen
+    # Los siguientes campos son opcionales — archivos generados antes de estas versiones no los tienen
     _gravity_probs = payload.get("gravity_probs", {})
+    _timeseries = payload.get("timeseries", {})
+    _trend = payload.get("trend", {})
     log.info(
         f"  {len(_stops_lookup):,} paradas, "
         f"{len(_od_probs):,} pares OD, "
-        f"{len(_activity):,} registros de actividad, "
-        f"{len(_gravity_probs):,} orígenes gravedad cargados."
+        f"{len(_gravity_probs):,} orígenes gravedad, "
+        f"{len(_timeseries):,} series temporales cargadas."
     )
     return True
+
+
+# =============================================================================
+# _compute_monthly_series() — Calcula series temporales y tendencias por parada
+#
+# Una "serie temporal" es simplemente la actividad de una parada mes a mes,
+# como un historial de cuánta gente la usó en enero 2022, febrero 2022, etc.
+#
+# Para detectar tendencias usamos "regresión lineal" (mínimos cuadrados ordinarios):
+# trazamos la línea recta que mejor se ajusta a todos los puntos del historial.
+# Si la línea sube, la parada está creciendo. Si baja, está perdiendo actividad.
+#
+# R² (coeficiente de determinación) nos dice qué tan confiable es esa línea:
+#   R² = 1.0 → la línea explica perfectamente los datos (raro en datos reales)
+#   R² = 0.5 → la línea explica la mitad de la variación
+#   R² = 0.0 → la línea no explica nada — los datos son demasiado irregulares
+#
+# Recibe od_with_months: el DataFrame de viajes ANTES de la agregación por tiempo,
+# con columna "month" en formato "YYYY-MM".
+# =============================================================================
+def _compute_monthly_series(od_with_months: pd.DataFrame) -> None:
+    global _timeseries, _trend
+
+    stops_with_coords = set(_stops_lookup.keys())  # Solo paradas con coordenadas en el mapa
+
+    log.info("Calculando series temporales mensuales ...")
+
+    # ── Subidas (boardings): cuántas personas SALIERON de cada parada cada mes ──
+    monthly_board = (
+        od_with_months.groupby(["origin_stop", "month"])["quantity"]
+        .sum().reset_index()
+        .rename(columns={"origin_stop": "stop_id", "quantity": "boardings"})
+    )
+
+    # ── Bajadas (alightings): cuántas personas LLEGARON a cada parada cada mes ──
+    monthly_alight = (
+        od_with_months.groupby(["destination_stop", "month"])["quantity"]
+        .sum().reset_index()
+        .rename(columns={"destination_stop": "stop_id", "quantity": "alightings"})
+    )
+
+    # Unimos subidas y bajadas. "outer" porque una parada puede tener bajadas pero
+    # no subidas en algún mes específico, o viceversa.
+    monthly = (
+        monthly_board
+        .merge(monthly_alight, on=["stop_id", "month"], how="outer")
+        .fillna(0)
+        .sort_values(["stop_id", "month"])
+    )
+    monthly["boardings"]  = monthly["boardings"].astype(int)
+    monthly["alightings"] = monthly["alightings"].astype(int)
+    monthly["total"]      = monthly["boardings"] + monthly["alightings"]
+
+    # ── Construir el diccionario de series temporales ─────────────────────────
+    for stop_id, grp in monthly.groupby("stop_id"):
+        if stop_id not in stops_with_coords:
+            continue  # Ignoramos paradas que no aparecen en el mapa
+        _timeseries[stop_id] = [
+            {
+                "month":      row.month,
+                "boardings":  int(row.boardings),
+                "alightings": int(row.alightings),
+                "total":      int(row.total),
+            }
+            for row in grp.itertuples(index=False)
+        ]
+
+    log.info(f"  {len(_timeseries):,} series temporales construidas")
+
+    # ── Regresión lineal por parada ───────────────────────────────────────────
+    # Para cada parada calculamos la pendiente (¿cuántos viajes gana o pierde
+    # por mes?) y la proyección de los próximos 3 meses.
+    log.info("Calculando tendencias y proyecciones ...")
+    for stop_id, data in _timeseries.items():
+        if len(data) < 3:
+            continue  # Con menos de 3 puntos la regresión no es significativa
+
+        x = np.arange(len(data), dtype=np.float64)         # Índice numérico del mes: 0, 1, 2, ...
+        y = np.array([d["total"] for d in data], dtype=np.float64)
+
+        # np.polyfit calcula los coeficientes de la línea recta que minimiza
+        # la suma de errores al cuadrado. Devuelve [pendiente, intercepto].
+        coeffs = np.polyfit(x, y, 1)
+        slope     = float(coeffs[0])    # Viajes ganados (o perdidos) por mes
+        intercept = float(coeffs[1])
+
+        # ── Calcular R² ───────────────────────────────────────────────────────
+        # R² = 1 - (suma de errores del modelo) / (suma de variación total)
+        y_pred  = np.polyval(coeffs, x)
+        ss_res  = float(np.sum((y - y_pred) ** 2))
+        ss_tot  = float(np.sum((y - np.mean(y)) ** 2))
+        r_sq    = round(max(0.0, min(1.0, 1.0 - ss_res / ss_tot)), 3) if ss_tot > 0 else 0.0
+
+        # ── Clasificar la dirección ───────────────────────────────────────────
+        # "Estable" si el cambio mensual es menor al 2% de la media de actividad
+        mean_act = float(np.mean(y))
+        if mean_act > 0 and abs(slope) / mean_act < 0.02:
+            direction = "stable"
+        elif slope > 0:
+            direction = "growing"
+        else:
+            direction = "declining"
+
+        # ── Proyección de los próximos 3 meses ───────────────────────────────
+        last_idx      = len(data) - 1
+        last_month_str = data[-1]["month"]  # "YYYY-MM"
+        last_y, last_m = int(last_month_str[:4]), int(last_month_str[5:7])
+        projection = []
+        for i in range(1, 4):
+            proj_val = max(0.0, float(np.polyval(coeffs, last_idx + i)))
+            m = last_m + i
+            y_off = (m - 1) // 12
+            m = ((m - 1) % 12) + 1
+            projection.append({
+                "month":            f"{last_y + y_off:04d}-{m:02d}",
+                "projected_total":  round(proj_val),
+            })
+
+        _trend[stop_id] = {
+            "slope":          round(slope, 1),
+            "direction":      direction,
+            "projection_3m":  projection,
+            "r_squared":      r_sq,
+        }
+
+    log.info(f"  {len(_trend):,} tendencias calculadas")
 
 
 # =============================================================================
@@ -118,7 +248,7 @@ def _load_from_precomputed() -> bool:
 def _load_from_csvs() -> None:
     # "global" le dice a Python que queremos modificar las variables de arriba,
     # no crear variables locales nuevas con el mismo nombre.
-    global _stops_lookup, _od_probs, _activity, _time_periods, _stops_with_trips
+    global _stops_lookup, _od_probs, _activity, _time_periods, _stops_with_trips, _timeseries, _trend
 
     # ── 1. Cargar paradas (stops.txt) ─────────────────────────────────────────
     # stops.txt es un archivo del formato GTFS (estándar de transporte público).
@@ -173,7 +303,7 @@ def _load_from_csvs() -> None:
         log.info(f"  Reading {Path(path).name} …")
         df = pd.read_csv(
             path,
-            usecols=["time", "origin_stop", "destination_stop", "quantity"],  # Solo las 4 columnas útiles
+            usecols=["month", "time", "origin_stop", "destination_stop", "quantity"],  # Leemos también "month" para la serie temporal
             dtype={"origin_stop": str, "destination_stop": str},  # IDs como texto, igual que en stops.txt
             low_memory=False,  # Evita una advertencia de pandas cuando hay tipos de datos mezclados en el CSV
         )
@@ -201,7 +331,12 @@ def _load_from_csvs() -> None:
     # Eliminamos cualquier fila que tenga valores vacíos en las columnas clave.
     od = od.dropna(subset=["origin_stop", "destination_stop", "quantity"])
 
-    # ── 4. Agregar los 6 meses en una sola tabla ──────────────────────────────
+    # ── 3b. Calcular series temporales y tendencias ───────────────────────────
+    # Hacemos esto ANTES de la agregación porque la columna "month" se pierde
+    # en el groupby siguiente, que agrupa sin importar el mes del año.
+    _compute_monthly_series(od)
+
+    # ── 4. Agregar todos los meses en una sola tabla ──────────────────────────
     # En vez de tener filas separadas para octubre, noviembre, etc. del mismo viaje,
     # las sumamos todas. Así obtenemos el total de 6 meses para cada combinación
     # de (origen, periodo, destino).
@@ -557,6 +692,32 @@ def get_activity(origin_stop_id: str, time_period: str):
 #
 # Devuelve: lista de hasta 50 objetos con stop_id, stop_name, lat, lon, probability
 # =============================================================================
+# =============================================================================
+# Endpoint: GET /trend?stop_id=X
+#
+# Devuelve la serie temporal completa (un registro por mes del dataset) y el
+# resultado de la regresión lineal para una parada dada.
+# El modo "Tendencia" del frontend usa esto para dibujar el gráfico SVG
+# y mostrar la proyección de los próximos 3 meses.
+#
+# Parámetros:
+#   stop_id — ID de la parada
+#
+# Devuelve: {stop_id, stop_name, timeseries: [...], trend: {...}}
+# =============================================================================
+@app.get("/trend")
+def get_trend(stop_id: str):
+    ts = _timeseries.get(stop_id)
+    if not ts:
+        return {}
+    return {
+        "stop_id":    stop_id,
+        "stop_name":  _stops_lookup.get(stop_id, {}).get("name", ""),
+        "timeseries": ts,
+        "trend":      _trend.get(stop_id),  # Puede ser None si hay pocos meses de datos
+    }
+
+
 @app.get("/predict/gravity")
 def predict_gravity(origin_stop_id: str):
     # El modelo de gravedad devuelve la misma lista sin importar el periodo de tiempo.
