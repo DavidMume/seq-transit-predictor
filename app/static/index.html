@@ -524,7 +524,6 @@ let map, heatLayer;
 let selectedMarker = null;
 let currentOriginId = null;
 let currentModel = 'empirical';
-let allMarkers = [];
 let timePeriods = [];
 
 // ============================================================================
@@ -539,8 +538,6 @@ map = L.map('map', { zoomControl: true, preferCanvas: true })
 // Exponemos el mapa como variable global de la ventana para poder acceder
 // a él desde herramientas externas (como scripts de captura de pantalla).
 window._seqMap = map;
-
-map.on('zoomend', updateMarkerSizes);
 
 // Añadimos la capa de mosaicos (tiles): las imágenes del mapa base oscuro de CartoDB.
 // {s} se reemplaza por uno de los subdominios (a, b, c, d) para distribuir la carga.
@@ -687,33 +684,6 @@ function activityBand(activity, thresholds) {
   return 4;
 }
 
-// Returns marker radius for a given zoom level and activity band (0-4)
-function getRadiusByZoom(zoom, band) {
-  const baseByZoom = {7: 1, 8: 1.5, 9: 2, 10: 3, 11: 4, 12: 5, 13: 6, 14: 7};
-  const z = Math.min(Math.max(Math.floor(zoom), 7), 14);
-  const base = baseByZoom[z];
-  const bandScale = [1.0, 1.2, 1.4, 1.7, 2.1][band];
-  return Math.max(1, base * bandScale);
-}
-
-// Re-sizes all non-selected markers when zoom changes
-function updateMarkerSizes() {
-  const zoom = map.getZoom();
-  const weight      = zoom < 10 ? 0.5 : 1;
-  const fillOpacity = zoom < 9  ? 0.7 : 0.85;
-  allMarkers.forEach(m => {
-    const r = getRadiusByZoom(zoom, m.activityBand);
-    m.stopRadius          = r;
-    m.stopStyle.radius    = r;
-    m.stopStyle.weight    = weight;
-    m.stopStyle.fillOpacity = fillOpacity;
-    if (m !== selectedMarker) {
-      m.setRadius(r);
-      m.setStyle({ weight, fillOpacity });
-    }
-  });
-}
-
 // ============================================================================
 // setModel() — Cambia el modelo de predicción activo
 //
@@ -831,27 +801,21 @@ async function init() {
   const thresholds = [pct(0.20), pct(0.40), pct(0.60), pct(0.80)];
 
   // --- Colocar marcadores en el mapa para cada parada ----------------------
-  const initZoom    = map.getZoom();
-  const initWeight  = initZoom < 10 ? 0.5 : 1;
-  const initOpacity = initZoom < 9  ? 0.7 : 0.85;
   stops.forEach(stop => {
     const band = activityBand(stop.total_activity || 0, thresholds);
-    const r    = getRadiusByZoom(initZoom, band);
     const style = {
-      radius:      r,
+      radius:      ACTIVITY_RADII[band],
       fillColor:   ACTIVITY_COLOURS[band],
       color:       '#ffffff',
-      weight:      initWeight,
-      fillOpacity: initOpacity,
+      weight:      1,
+      fillOpacity: 0.85,
     };
     const m = L.circleMarker([stop.lat, stop.lon], style).addTo(map);
-    m.stopData     = stop;
-    m.activityBand = band;
-    m.stopStyle    = style;
-    m.stopRadius   = r;
+    m.stopData  = stop;
+    m.stopStyle = style;
+    m.stopRadius = style.radius;
     m.bindTooltip(stop.stop_name, { sticky: true, direction: 'top', offset: [0, -4] });
     m.on('click', () => selectStop(stop.stop_id, m));
-    allMarkers.push(m);
   });
 
   document.getElementById('loading').style.display = 'none';
