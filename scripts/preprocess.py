@@ -17,10 +17,14 @@ import pickle
 from glob import glob
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
-DATA_DIR = Path(__file__).parent.parent / "data"
+DATA_DIR    = Path(__file__).parent.parent / "data"
 OUTPUT_PATH = DATA_DIR / "precomputed.pkl.gz"
+
+MONTHS = {'202510', '202511', '202512', '202601', '202602', '202603'}
+TOP_N  = 10
 
 
 def main():
@@ -49,10 +53,11 @@ def main():
 
     # ── CSVs de viajes ────────────────────────────────────────────
     print("\n[2/6] Leyendo archivos CSV ...")
-    csv_files = sorted(glob(str(DATA_DIR / "*TL Org-Dest Trips.csv")))
+    all_csv   = sorted(glob(str(DATA_DIR / "*TL Org-Dest Trips.csv")))
+    csv_files = [f for f in all_csv if any(m in Path(f).name for m in MONTHS)]
     if not csv_files:
-        raise FileNotFoundError(f"No se encontraron archivos CSV en {DATA_DIR}")
-    print(f"    {len(csv_files)} archivos encontrados")
+        raise FileNotFoundError(f"No CSV files found for months {MONTHS} in {DATA_DIR}")
+    print(f"    {len(csv_files)} archivos ({sorted(MONTHS)})")
 
     frames = []
     for path in csv_files:
@@ -100,10 +105,10 @@ def main():
 
     od_probs = {}
     for (origin, time_period), grp in od_valid.groupby(["origin_stop", "time"]):
-        top50 = grp.nlargest(50, "prob")
+        top_rows = grp.nlargest(TOP_N, "prob")
         od_probs[(origin, time_period)] = [
-            (row.destination_stop, float(row.prob))
-            for row in top50.itertuples(index=False)
+            (row.destination_stop, float(np.float32(row.prob)))
+            for row in top_rows.itertuples(index=False)
         ]
     print(f"    {len(od_probs):,} pares (origen, periodo) indexados")
 
